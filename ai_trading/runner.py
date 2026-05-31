@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import signal
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 from ai_trading.bot import run_once
+
+
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Handle graceful shutdown on SIGINT/SIGTERM."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    print(f"\nShutdown signal received (sig={signum}). Finishing current cycle...")
 
 
 def seconds_until(hour: int, minute: int) -> float:
@@ -15,27 +27,80 @@ def seconds_until(hour: int, minute: int) -> float:
     return (target - now).total_seconds()
 
 
+def _health_check() -> bool:
+    """Basic health check: verify we can import and configure."""
+    try:
+        from ai_trading.config import Settings
+        settings = Settings.from_env()
+        settings.validate()
+        return True
+    except Exception as exc:
+        print(f"Health check failed: {exc}", file=sys.stderr)
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Daily scheduling stub for educational use. "
-            "Use cron/systemd/task scheduler in production."
+            "Daily scheduling runner for the trading bot. "
+            "Supports both paper and live modes. "
+            "Use cron/systemd/task scheduler for production deployments."
         )
     )
     parser.add_argument("--run-time", default="20:10", help="UTC HH:MM daily run time")
     parser.add_argument("--loop", action="store_true", help="Run continuously every day")
+    parser.add_argument("--symbol", help="Optional symbol override")
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="Skip live-order confirmation (for automated scheduled runs)",
+    )
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Run health check and exit",
+    )
     args = parser.parse_args()
+
+    if args.health_check:
+        if _health_check():
+            print("Health check passed.")
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
+    # Register graceful shutdown handlers
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     hour, minute = [int(x) for x in args.run_time.split(":", maxsplit=1)]
 
     if not args.loop:
-        run_once()
+        run_once(symbol_override=args.symbol, skip_confirmation=args.no_confirm)
         return
 
-    while True:
+    print(f"Runner started. Scheduled daily at {hour:02d}:{minute:02d} UTC.")
+    print("Press Ctrl+C for graceful shutdown.")
+
+    while not _shutdown_requested:
         wait_seconds = seconds_until(hour, minute)
-        time.sleep(wait_seconds)
-        run_once()
+        print(f"Next run in {wait_seconds:.0f}s ({wait_seconds/3600:.1f}h)")
+
+        # Sleep in small increments to allow graceful shutdown
+        sleep_end = time.time() + wait_seconds
+        while time.time() < sleep_end and not _shutdown_requested:
+            time.sleep(min(30, sleep_end - time.time()))
+
+        if _shutdown_requested:
+            break
+
+        print(f"[{datetime.now(timezone.utc).isoformat()}] Starting scheduled run...")
+        try:
+            run_once(symbol_override=args.symbol, skip_confirmation=args.no_confirm)
+        except Exception as exc:
+            print(f"Run failed with error: {exc}", file=sys.stderr)
+
+    print("Runner shut down gracefully.")
 
 
 if __name__ == "__main__":
