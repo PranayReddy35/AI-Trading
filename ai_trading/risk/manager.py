@@ -98,7 +98,7 @@ class RiskManager:
                 return RiskResult(False, f"trade cooldown active ({remaining}s remaining)")
 
         # Minimum equity guard
-        if self.min_equity > 0 and equity > 0 and equity < self.min_equity:
+        if self.min_equity > 0 and 0 < equity < self.min_equity:
             return RiskResult(
                 False,
                 f"equity ${equity:.2f} below minimum ${self.min_equity:.2f}",

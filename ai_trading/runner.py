@@ -73,7 +73,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    hour, minute = [int(x) for x in args.run_time.split(":", maxsplit=1)]
+    hour, minute = None, None
+    try:
+        parts = args.run_time.split(":", maxsplit=1)
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, IndexError):
+        parser.error(f"Invalid --run-time '{args.run_time}'. Expected format: HH:MM (e.g., 20:10)")
 
     if not args.loop:
         run_once(symbol_override=args.symbol, skip_confirmation=args.no_confirm)

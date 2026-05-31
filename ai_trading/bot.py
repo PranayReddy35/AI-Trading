@@ -160,9 +160,11 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         if settings.order_type == "limit":
             offset_mult = 1 + (settings.limit_price_offset_pct / 100.0)
             if action == "BUY":
+                # Place limit slightly above current price to improve fill chance
                 limit_price = signal.close * offset_mult
             else:
-                limit_price = signal.close * (2 - offset_mult)
+                # Place limit slightly below current price (mirror of buy offset)
+                limit_price = signal.close * (1 - settings.limit_price_offset_pct / 100.0)
 
         # Submit order with retry logic
         order = broker.submit_order(

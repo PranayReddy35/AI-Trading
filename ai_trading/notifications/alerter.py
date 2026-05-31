@@ -54,7 +54,7 @@ class Notifier:
                 method="POST",
             )
             with urlopen(req, timeout=10) as resp:
-                if resp.status < 300:
+                if 200 <= resp.status < 300:
                     return True
                 logger.warning("Webhook returned status %d", resp.status)
                 return False

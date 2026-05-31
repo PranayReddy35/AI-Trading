@@ -10,7 +10,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
-    TrailingStopOrderRequest,
+    StopOrderRequest,
 )
 
 logger = logging.getLogger("ai_trading")
@@ -144,7 +144,8 @@ class AlpacaBroker:
                     raise OrderError(
                         f"Order failed after {max_retries} attempts: {exc}"
                     ) from exc
-                wait = 2 ** attempt
+                # Exponential backoff: 2s, 4s, 8s (capped at 8s)
+                wait = min(2 ** attempt, 8)
                 logger.warning(
                     "Order attempt %d/%d failed (%s), retrying in %ds...",
                     attempt, max_retries, exc, wait,
@@ -157,13 +158,13 @@ class AlpacaBroker:
         qty: int,
         stop_price: float,
     ) -> Any:
-        """Submit a stop-loss order to protect a position."""
-        order_request = TrailingStopOrderRequest(
+        """Submit a stop-loss order at an absolute price to protect a position."""
+        order_request = StopOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
-            trail_price=round(stop_price, 2),
+            stop_price=round(stop_price, 2),
         )
         order = self.client.submit_order(order_data=order_request)
         logger.info("Stop-loss order submitted: id=%s stop_price=%.2f", order.id, stop_price)
