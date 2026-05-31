@@ -62,6 +62,12 @@ class Settings:
     use_sentiment_in_ml: bool = True
     # Extra keywords to search for news (comma-separated)
     news_keywords: str = ""
+    # Social media sentiment: include Reddit posts in sentiment analysis (free, no key)
+    use_social_sentiment: bool = False
+    # Comma-separated subreddits to search (default: wallstreetbets,stocks,investing,options,stockmarket)
+    social_subreddits: str = ""
+    # Time filter for Reddit search: "hour", "day", "week", "month", "year", "all"
+    social_time_filter: str = "week"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -101,6 +107,9 @@ class Settings:
             sentiment_sell_threshold=float(os.getenv("BOT_SENTIMENT_SELL_THRESHOLD", "0.3")),
             use_sentiment_in_ml=os.getenv("BOT_USE_SENTIMENT_IN_ML", "true").lower() == "true",
             news_keywords=os.getenv("BOT_NEWS_KEYWORDS", ""),
+            use_social_sentiment=os.getenv("BOT_USE_SOCIAL_SENTIMENT", "false").lower() == "true",
+            social_subreddits=os.getenv("BOT_SOCIAL_SUBREDDITS", ""),
+            social_time_filter=os.getenv("BOT_SOCIAL_TIME_FILTER", "week").lower(),
         )
 
     def validate(self) -> None:

@@ -32,6 +32,7 @@ CATEGORY_WEIGHTS: dict[str, float] = {
     "analyst": 1.2,
     "politics": 1.1,
     "macro": 1.1,
+    "social": 0.8,  # Social media posts are noisier, lower weight
     "general": 1.0,
 }
 
@@ -230,10 +231,12 @@ def compute_sentiment_features(
     earnings_articles = [a for a in articles_3d if a.category == "earnings"]
     political_articles = [a for a in articles_3d if a.category == "politics"]
     ceo_articles = [a for a in articles_3d if a.category == "ceo"]
+    social_articles = [a for a in articles_3d if a.category == "social"]
 
     earnings_sent = analyzer.aggregate_sentiment(earnings_articles).score
     political_sent = analyzer.aggregate_sentiment(political_articles).score
     ceo_sent = analyzer.aggregate_sentiment(ceo_articles).score
+    social_sent = analyzer.aggregate_sentiment(social_articles).score
 
     return {
         "sentiment_score_1d": agg_1d.score,
@@ -246,4 +249,5 @@ def compute_sentiment_features(
         "earnings_sentiment": earnings_sent,
         "political_sentiment": political_sent,
         "ceo_sentiment": ceo_sent,
+        "social_sentiment": social_sent,
     }

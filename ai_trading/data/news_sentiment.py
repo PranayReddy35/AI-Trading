@@ -238,7 +238,8 @@ def fetch_news(
 
     Args:
         symbol: Stock ticker symbol.
-        provider: "rss" (Google News, free, no key) or "alphavantage" (free tier).
+        provider: "rss" (Google News, free, no key), "alphavantage" (free tier),
+                  or "reddit" (free, no key — social media sentiment).
         api_key: API key (required for alphavantage only).
         max_articles: Maximum articles to return.
         keywords: Extra search keywords (used by RSS provider).
@@ -251,6 +252,11 @@ def fetch_news(
             logger.warning("Alpha Vantage requires an API key. Falling back to RSS.")
             return fetch_google_news_rss(symbol, max_articles, keywords)
         return fetch_alphavantage_news(symbol, api_key, max_articles)
+
+    if provider == "reddit":
+        from ai_trading.data.social_sentiment import fetch_reddit_posts
+
+        return fetch_reddit_posts(symbol, max_posts=max_articles)
 
     # Default: RSS (Google News)
     return fetch_google_news_rss(symbol, max_articles, keywords)
@@ -271,6 +277,10 @@ _CATEGORY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("analyst", re.compile(r"\b(upgrade|downgrade|price target|analyst|rating)\b", re.IGNORECASE)),
     ("macro", re.compile(
         r"\b(inflation|GDP|unemployment|interest rate|CPI|jobs report|recession)\b",
+        re.IGNORECASE,
+    )),
+    ("social", re.compile(
+        r"\b(YOLO|diamond hands|to the moon|squeeze|apes?|tendies|DD|due diligence|WSB)\b",
         re.IGNORECASE,
     )),
 ]

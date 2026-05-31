@@ -20,6 +20,7 @@ Production-ready module structure:
 - `ai_trading/backtest.py` – backtest matching rule-based MA logic with daily bars
 - `ai_trading/ml/predict_direction.py` – separate ML (logistic regression) next-day direction script
 - `ai_trading/data/news_sentiment.py` – news fetcher (Google News RSS free, Alpha Vantage free tier)
+- `ai_trading/data/social_sentiment.py` – social media fetcher (Reddit public API, free, no key)
 - `ai_trading/ml/sentiment.py` – VADER-based sentiment scoring and feature engineering
 - `ai_trading/strategy/sentiment_filter.py` – sentiment overlay that can block trades on extreme news
 
@@ -154,6 +155,23 @@ export BOT_USE_SENTIMENT_IN_ML="true"
 export BOT_NEWS_KEYWORDS=""
 ```
 
+### Social media sentiment (Reddit)
+
+```bash
+# Enable Reddit social media sentiment (free, no API key needed)
+export BOT_USE_SOCIAL_SENTIMENT="true"
+
+# Custom subreddits to search (comma-separated, default: wallstreetbets,stocks,investing,options,stockmarket)
+export BOT_SOCIAL_SUBREDDITS=""
+
+# Time filter for Reddit search: "hour", "day", "week", "month", "year", "all"
+export BOT_SOCIAL_TIME_FILTER="week"
+```
+
+> **Note on other social platforms:**
+> - **Twitter/X**: The free API tier does NOT support reading tweets (only posting). Not viable at zero cost.
+> - **Discord**: Requires bot membership in specific servers. No public API for sentiment data.
+
 ## Run the bot
 
 ### Paper trading (safe, default)
@@ -236,6 +254,14 @@ python -m ai_trading.ml.predict_direction --symbol AAPL --with-sentiment
 ```
 
 This fetches live news headlines, scores them with VADER sentiment analysis, and combines the result with the technical prediction. Covers: earnings calls, CEO statements, political news, analyst upgrades/downgrades, macro events.
+
+### With social media sentiment (Reddit)
+
+```bash
+python -m ai_trading.ml.predict_direction --symbol AAPL --with-sentiment --news-provider reddit
+```
+
+This fetches posts from Reddit finance subreddits (r/wallstreetbets, r/stocks, r/investing, etc.), analyzes social sentiment using VADER, and incorporates it into the ML prediction. Completely free, no API key needed.
 
 Use Alpha Vantage (free, 25 req/day) for better relevance scoring:
 
