@@ -10,6 +10,7 @@ from ai_trading.notifications.alerter import Notifier
 from ai_trading.risk.manager import RiskManager
 from ai_trading.storage.journal import Journal, configure_logging
 from ai_trading.strategy.moving_average import moving_average_signal
+from ai_trading.strategy.sentiment_filter import apply_sentiment_filter
 
 
 LIVE_WARNING = (
@@ -114,12 +115,43 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
             },
         )
 
+        # Apply sentiment filter if enabled
+        effective_signal = signal.signal
+        if settings.use_sentiment_filter and signal.signal != "HOLD":
+            keywords = [k.strip() for k in settings.news_keywords.split(",") if k.strip()] or None
+            sentiment_result = apply_sentiment_filter(
+                signal=signal.signal,
+                symbol=settings.symbol,
+                buy_threshold=settings.sentiment_buy_threshold,
+                sell_threshold=settings.sentiment_sell_threshold,
+                provider=settings.news_provider,
+                api_key=settings.news_api_key,
+                keywords=keywords,
+            )
+            effective_signal = sentiment_result.filtered_signal
+            journal.write(
+                "sentiment_filter",
+                {
+                    "original_signal": sentiment_result.original_signal,
+                    "filtered_signal": sentiment_result.filtered_signal,
+                    "sentiment_score": sentiment_result.sentiment_score,
+                    "blocked": sentiment_result.blocked,
+                    "reason": sentiment_result.reason,
+                },
+            )
+            if sentiment_result.blocked:
+                logger.info(
+                    "Sentiment filter blocked %s: %s",
+                    signal.signal,
+                    sentiment_result.reason,
+                )
+
         action = "HOLD"
         requested_qty = 0
-        if signal.signal == "BUY" and position_qty == 0:
+        if effective_signal == "BUY" and position_qty == 0:
             action = "BUY"
             requested_qty = settings.max_shares
-        elif signal.signal == "SELL" and position_qty > 0:
+        elif effective_signal == "SELL" and position_qty > 0:
             action = "SELL"
             requested_qty = position_qty
 

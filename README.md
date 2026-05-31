@@ -19,6 +19,9 @@ Production-ready module structure:
 - `ai_trading/runner.py` – daily scheduling runner with graceful shutdown
 - `ai_trading/backtest.py` – backtest matching rule-based MA logic with daily bars
 - `ai_trading/ml/predict_direction.py` – separate ML (logistic regression) next-day direction script
+- `ai_trading/data/news_sentiment.py` – news fetcher (Google News RSS free, Alpha Vantage free tier)
+- `ai_trading/ml/sentiment.py` – VADER-based sentiment scoring and feature engineering
+- `ai_trading/strategy/sentiment_filter.py` – sentiment overlay that can block trades on extreme news
 
 ## Safety and risk controls
 
@@ -128,6 +131,29 @@ export BOT_WEBHOOK_URL="https://hooks.slack.com/services/..."
 export BOT_NOTIFY_EVENTS="trade,error,risk_reject"
 ```
 
+### News sentiment
+
+```bash
+# News provider: "rss" (Google News, free, no key) or "alphavantage" (free, 25 req/day)
+export BOT_NEWS_PROVIDER="rss"
+
+# Alpha Vantage API key (free at alphavantage.co — only needed if using alphavantage provider)
+export BOT_NEWS_API_KEY=""
+
+# Enable sentiment filter on trading signals (blocks trades on extreme sentiment)
+export BOT_USE_SENTIMENT_FILTER="true"
+
+# Sentiment thresholds (-1.0 to 1.0): block BUY if below, block SELL if above
+export BOT_SENTIMENT_BUY_THRESHOLD="-0.3"
+export BOT_SENTIMENT_SELL_THRESHOLD="0.3"
+
+# Include sentiment features in ML model predictions
+export BOT_USE_SENTIMENT_IN_ML="true"
+
+# Extra news search keywords (comma-separated, e.g., "CEO,earnings,Fed")
+export BOT_NEWS_KEYWORDS=""
+```
+
 ## Run the bot
 
 ### Paper trading (safe, default)
@@ -201,6 +227,20 @@ The ML path is intentionally separate and beginner-friendly.
 
 ```bash
 python -m ai_trading.ml.predict_direction --symbol SPY --start 2018-01-01 --end 2025-01-01
+```
+
+### With sentiment analysis (live news)
+
+```bash
+python -m ai_trading.ml.predict_direction --symbol AAPL --with-sentiment
+```
+
+This fetches live news headlines, scores them with VADER sentiment analysis, and combines the result with the technical prediction. Covers: earnings calls, CEO statements, political news, analyst upgrades/downgrades, macro events.
+
+Use Alpha Vantage (free, 25 req/day) for better relevance scoring:
+
+```bash
+python -m ai_trading.ml.predict_direction --symbol AAPL --with-sentiment --news-provider alphavantage --news-api-key YOUR_KEY
 ```
 
 Optional model export:

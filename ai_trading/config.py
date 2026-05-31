@@ -47,6 +47,22 @@ class Settings:
     # Pre-flight check: require minimum equity before trading
     min_equity: float = 0.0
 
+    # --- Sentiment / News settings ---
+    # News provider: "rss" (Google News, free, no key) or "alphavantage" (free tier)
+    news_provider: str = "rss"
+    # API key for Alpha Vantage news (free at alphavantage.co, 25 req/day)
+    news_api_key: str = ""
+    # Enable sentiment filter on MA strategy (blocks trades on extreme sentiment)
+    use_sentiment_filter: bool = False
+    # Sentiment threshold: block BUY if sentiment below this (-1 to 1)
+    sentiment_buy_threshold: float = -0.3
+    # Sentiment threshold: block SELL if sentiment above this (-1 to 1)
+    sentiment_sell_threshold: float = 0.3
+    # Include sentiment features in ML model
+    use_sentiment_in_ml: bool = True
+    # Extra keywords to search for news (comma-separated)
+    news_keywords: str = ""
+
     @classmethod
     def from_env(cls) -> "Settings":
         api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -78,6 +94,13 @@ class Settings:
             notify_events=[e.strip() for e in notify_events_raw.split(",") if e.strip()],
             trade_cooldown_sec=max(0, int(os.getenv("BOT_TRADE_COOLDOWN_SEC", "0"))),
             min_equity=float(os.getenv("BOT_MIN_EQUITY", "0")),
+            news_provider=os.getenv("BOT_NEWS_PROVIDER", "rss").lower(),
+            news_api_key=os.getenv("BOT_NEWS_API_KEY", ""),
+            use_sentiment_filter=os.getenv("BOT_USE_SENTIMENT_FILTER", "false").lower() == "true",
+            sentiment_buy_threshold=float(os.getenv("BOT_SENTIMENT_BUY_THRESHOLD", "-0.3")),
+            sentiment_sell_threshold=float(os.getenv("BOT_SENTIMENT_SELL_THRESHOLD", "0.3")),
+            use_sentiment_in_ml=os.getenv("BOT_USE_SENTIMENT_IN_ML", "true").lower() == "true",
+            news_keywords=os.getenv("BOT_NEWS_KEYWORDS", ""),
         )
 
     def validate(self) -> None:
