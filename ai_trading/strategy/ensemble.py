@@ -95,7 +95,9 @@ def detect_regime(bars: pd.DataFrame, lookback: int = 60) -> RegimeState:
     trend_strength = (trend_20 + trend_50) / 2
 
     # MA slope as additional trend signal
-    ma_20_slope = float((ma_20.iloc[-1] - ma_20.iloc[-5]) / ma_20.iloc[-5]) if len(ma_20) >= 5 and pd.notna(ma_20.iloc[-5]) and ma_20.iloc[-5] != 0 else 0
+    ma_20_slope = 0.0
+    if len(ma_20) >= 5 and pd.notna(ma_20.iloc[-5]) and ma_20.iloc[-5] != 0:
+        ma_20_slope = float((ma_20.iloc[-1] - ma_20.iloc[-5]) / ma_20.iloc[-5])
 
     # Volatility analysis
     returns = close.pct_change().dropna()

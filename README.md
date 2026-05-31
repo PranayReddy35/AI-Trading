@@ -10,15 +10,18 @@ Production-ready module structure:
 
 - `ai_trading/config.py` – runtime settings from environment variables (paper + live)
 - `ai_trading/data/` – market data access (Alpaca)
-- `ai_trading/strategy/` – moving-average signal generation
+- `ai_trading/strategy/` – signal generation (MA, ensemble, regime-adaptive)
+- `ai_trading/strategy/ensemble.py` – **multi-strategy ensemble** with regime detection
 - `ai_trading/risk/` – comprehensive risk checks and safety guards
 - `ai_trading/broker/` – Alpaca broker wrapper (market + limit orders, stop-loss, retry logic, order tracking)
 - `ai_trading/storage/` – logging + JSONL journaling
 - `ai_trading/notifications/` – webhook alerts (Slack, Discord, or generic)
 - `ai_trading/bot.py` – trading bot (single run, paper or live)
 - `ai_trading/runner.py` – daily scheduling runner with graceful shutdown
-- `ai_trading/backtest.py` – backtest matching rule-based MA logic with daily bars
-- `ai_trading/ml/predict_direction.py` – separate ML (logistic regression) next-day direction script
+- `ai_trading/backtest.py` – basic backtest (rule-based MA logic)
+- `ai_trading/backtest_realistic.py` – **realistic backtest** with slippage, commissions, Kelly sizing, Monte Carlo risk analysis
+- `ai_trading/ml/predict_direction.py` – basic ML (logistic regression) next-day direction script
+- `ai_trading/ml/ensemble_model.py` – **advanced ensemble ML** (GradientBoosting + RandomForest) with 35+ features and walk-forward validation
 - `ai_trading/data/news_sentiment.py` – news fetcher (Google News RSS free, Alpha Vantage free tier)
 - `ai_trading/data/social_sentiment.py` – social media fetcher (Reddit public API, free, no key)
 - `ai_trading/ml/sentiment.py` – VADER-based sentiment scoring and feature engineering
@@ -235,9 +238,82 @@ python -m ai_trading.backtest --csv /path/to/bars.csv
 
 Expected CSV columns: `date,open,high,low,close,volume`.
 
-## ML script (separate from rule-based bot)
+## Realistic backtest (advanced)
 
-The ML path is intentionally separate and beginner-friendly.
+The realistic backtest engine addresses all shortcomings of basic backtesting:
+
+- **Transaction costs**: Commissions, slippage, spread, and market impact modeling
+- **Kelly criterion position sizing**: Optimal bet sizing based on historical win rate
+- **Monte Carlo risk-of-ruin analysis**: 10,000 simulation paths to estimate ruin probability
+- **Multi-strategy support**: Test MA strategy or full ensemble strategy
+- **Advanced metrics**: Sharpe ratio, Sortino, max drawdown, Calmar, profit factor, expectancy
+- **Benchmark comparison**: Always compared against buy-and-hold
+
+```bash
+# Realistic backtest with ensemble strategy (recommended)
+python -m ai_trading.backtest_realistic --symbol SPY --start 2015-01-01 --end 2025-01-01 --strategy ensemble --initial-cash 100000
+
+# With custom transaction costs
+python -m ai_trading.backtest_realistic --symbol SPY --strategy ensemble --commission-per-share 0.005 --slippage-bps 5
+
+# Basic MA strategy for comparison
+python -m ai_trading.backtest_realistic --symbol SPY --strategy ma --fast-ma 10 --slow-ma 30
+
+# Disable Kelly sizing (use fixed position size)
+python -m ai_trading.backtest_realistic --symbol SPY --strategy ensemble --no-kelly
+```
+
+### Live trading readiness checklist (automated)
+
+The realistic backtest automatically evaluates 8 criteria:
+- ✓ Sharpe ratio > 1.5
+- ✓ Profit factor > 1.5
+- ✓ Beats buy-and-hold benchmark
+- ✓ Max drawdown < 20%
+- ✓ Win rate > 50%
+- ✓ Ruin probability < 5%
+- ✓ Kelly fraction > 0
+- ✓ Positive expectancy per trade
+
+## Advanced ML model (ensemble)
+
+The advanced ML path replaces logistic regression with a production-grade ensemble:
+
+- **Model**: VotingClassifier (GradientBoosting 60% + RandomForest 40%)
+- **Features**: 35+ technical indicators (RSI, MACD, Bollinger Bands, ATR, OBV, stochastic, momentum, patterns)
+- **Validation**: Walk-forward (rolling window) instead of single train/test split
+- **Calibration**: Isotonic probability calibration for reliable confidence estimates
+
+```bash
+# Walk-forward validation with 5 folds
+python -m ai_trading.ml.ensemble_model --symbol SPY --start 2015-01-01 --end 2025-01-01 --folds 5
+
+# Save trained model
+python -m ai_trading.ml.ensemble_model --symbol SPY --save-model ensemble_model.joblib
+```
+
+## Multi-strategy ensemble
+
+The ensemble strategy combines 4 uncorrelated signal generators:
+
+| Strategy | Best in regime | Description |
+|----------|---------------|-------------|
+| Trend following | Bull/Bear trends | Adaptive EMA crossover with slope confirmation |
+| Mean reversion | Sideways markets | Bollinger Bands + RSI oversold/overbought |
+| Momentum | Breakouts | Rate of change + volume surge detection |
+| ML model | All regimes | Ensemble probability as directional signal |
+
+Strategies are weighted by detected **market regime**:
+- **Bull trend**: Trend (45%) + Momentum (35%) + Mean reversion (10%) + ML (10%)
+- **Bear trend**: Trend (40%) + Momentum (20%) + Mean reversion (20%) + ML (20%)
+- **Sideways**: Mean reversion (45%) + ML (30%) + Momentum (15%) + Trend (10%)
+- **High volatility**: Mean reversion (30%) + ML (30%) + Trend (20%) + Momentum (20%)
+
+A trade is only executed when ≥2 strategies agree on direction (consensus filter).
+
+## ML script (basic — educational)
+
+The basic ML path is intentionally separate and beginner-friendly.
 
 - Model: logistic regression
 - Features: 1d return, 5d return, 10d volatility, distance from 20d MA, volume ratio vs 20d average
