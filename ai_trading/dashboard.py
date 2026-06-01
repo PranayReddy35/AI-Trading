@@ -18,6 +18,23 @@ if str(_project_root) not in sys.path:
 
 import pandas as pd
 import streamlit as st
+
+# ── Load Streamlit Cloud secrets into environment variables ────────────────────
+# This allows the app to work on Streamlit Cloud where secrets are configured
+# via the dashboard UI and accessed through st.secrets.
+_SECRET_KEYS = [
+    "APCA_API_KEY_ID",
+    "APCA_API_SECRET_KEY",
+    "BOT_PAPER_ONLY",
+    "BOT_WEBHOOK_URL",
+]
+for _key in _SECRET_KEYS:
+    if _key not in os.environ:
+        try:
+            os.environ[_key] = st.secrets[_key]
+        except (KeyError, FileNotFoundError):
+            pass
+
 from ai_trading.scanner import is_market_open, scan, scan_live
 
 st.set_page_config(

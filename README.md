@@ -373,6 +373,33 @@ Before going live with real money:
 9. ✅ Test with the smallest possible position size first
 10. ✅ Have a plan for what to do if the bot malfunctions
 
+## Deploy (Streamlit Community Cloud — free)
+
+The dashboard can be deployed for free on [Streamlit Community Cloud](https://share.streamlit.io/) so anyone with the link can access it.
+
+### Steps
+
+1. Push this repository to GitHub (public or private).
+2. Go to [share.streamlit.io](https://share.streamlit.io/) and sign in with GitHub.
+3. Click **"New app"** and select:
+   - **Repository**: `PranayReddy35/AI-Trading`
+   - **Branch**: `main`
+   - **Main file path**: `ai_trading/dashboard.py`
+4. Under **Advanced settings → Secrets**, add your secrets (TOML format):
+
+```toml
+APCA_API_KEY_ID = "YOUR_API_KEY"
+APCA_API_SECRET_KEY = "YOUR_API_SECRET"
+BOT_PAPER_ONLY = "true"
+BOT_WEBHOOK_URL = "YOUR_WEBHOOK_URL"
+```
+
+5. Click **Deploy**. You'll get a public URL like `https://your-app.streamlit.app`.
+
+### Share
+
+Anyone with the link can view the dashboard — no login required. The app refreshes market data in real-time during market hours.
+
 ## Important warnings
 
 - **This is not financial advice.** Use at your own risk.
