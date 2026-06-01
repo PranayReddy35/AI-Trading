@@ -4,3 +4,4 @@ __pycache__/
 logs/
 *.egg-info/
 .env
+.streamlit/secrets.toml
