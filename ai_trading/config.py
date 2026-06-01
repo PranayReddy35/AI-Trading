@@ -69,6 +69,76 @@ class Settings:
     # Time filter for Reddit search: "hour", "day", "week", "month", "year", "all"
     social_time_filter: str = "week"
 
+    # --- Multi-symbol settings ---
+    # Comma-separated list of symbols to trade (overrides symbol if set)
+    symbols: str = ""
+    # Max total positions open at once across all symbols
+    max_open_positions: int = 5
+    # Per-symbol capital allocation as % of equity (0 = equal weight)
+    per_symbol_allocation_pct: float = 0.0
+
+    # --- Intraday settings ---
+    # Bar timeframe: "1Day", "1Hour", "30Min", "15Min", "5Min"
+    bar_timeframe: str = "1Day"
+
+    # --- Kelly criterion position sizing ---
+    # Use Kelly criterion to size positions (requires win_rate and avg_win/loss)
+    use_kelly_sizing: bool = False
+    # Fraction of Kelly to use (0.5 = half-Kelly, safer)
+    kelly_fraction: float = 0.5
+    # Max shares Kelly is allowed to recommend (caps Kelly output)
+    kelly_max_shares: int = 10
+
+    # --- Trailing stop-loss ---
+    # Trailing stop as % below peak price (0 = disabled)
+    trailing_stop_pct: float = 0.0
+
+    # --- Portfolio drawdown halt ---
+    # Halt ALL trading if portfolio drops this % from its peak (0 = disabled)
+    portfolio_drawdown_halt_pct: float = 0.0
+
+    # --- Correlation filter ---
+    # Block new positions if correlation with existing positions exceeds this (0 = disabled)
+    correlation_filter_threshold: float = 0.0
+
+    # --- Auto ML retraining ---
+    # Retrain ML model every N days (0 = disabled)
+    ml_retrain_days: int = 0
+    # Path to save/load trained ML model
+    ml_model_path: str = "models/ensemble.joblib"
+
+    # --- Daily summary ---
+    # Send daily summary notification at this UTC hour (HH:MM, "" = disabled)
+    daily_summary_time: str = ""
+
+    # --- EOD close ---
+    # Automatically close all positions N minutes before market close (0 = disabled)
+    close_before_eod: int = 0
+
+    # --- Gap-open protection ---
+    # If price gaps more than this % from prior close on open, skip/exit the position (0 = disabled)
+    gap_open_protection_pct: float = 0.0
+
+    # --- Buy-the-dip strategy ---
+    # Enable dip-buying: buy when RSI oversold + price pulled back from recent high
+    dip_buy_enabled: bool = False
+    # RSI(14) must be at or below this to trigger (e.g. 35 = oversold)
+    dip_rsi_threshold: float = 35.0
+    # Price must have dropped at least this % from its N-day high
+    dip_drop_pct: float = 5.0
+    # Look this many bars back for the recent high
+    dip_lookback_days: int = 20
+    # Long-term MA period used as trend filter
+    dip_long_ma_period: int = 50
+    # Only buy dips when price is above the long-term MA (avoids falling knives)
+    dip_require_uptrend: bool = True
+
+    # --- Partial profit taking ---
+    # When unrealized gain reaches this %, sell partial_profit_sell_pct of the position (0 = disabled)
+    partial_profit_trigger_pct: float = 0.0
+    # How much of the position to sell when trigger fires (default 50 = sell half, hold rest forever)
+    partial_profit_sell_pct: float = 50.0
+
     @classmethod
     def from_env(cls) -> "Settings":
         api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -110,6 +180,29 @@ class Settings:
             use_social_sentiment=os.getenv("BOT_USE_SOCIAL_SENTIMENT", "false").lower() == "true",
             social_subreddits=os.getenv("BOT_SOCIAL_SUBREDDITS", ""),
             social_time_filter=os.getenv("BOT_SOCIAL_TIME_FILTER", "week").lower(),
+            symbols=os.getenv("BOT_SYMBOLS", ""),
+            max_open_positions=max(1, int(os.getenv("BOT_MAX_OPEN_POSITIONS", "5"))),
+            per_symbol_allocation_pct=float(os.getenv("BOT_PER_SYMBOL_ALLOCATION_PCT", "0")),
+            bar_timeframe=os.getenv("BOT_BAR_TIMEFRAME", "1Day"),
+            use_kelly_sizing=os.getenv("BOT_USE_KELLY_SIZING", "false").lower() == "true",
+            kelly_fraction=float(os.getenv("BOT_KELLY_FRACTION", "0.5")),
+            kelly_max_shares=max(1, int(os.getenv("BOT_KELLY_MAX_SHARES", "10"))),
+            trailing_stop_pct=float(os.getenv("BOT_TRAILING_STOP_PCT", "0")),
+            portfolio_drawdown_halt_pct=float(os.getenv("BOT_PORTFOLIO_DRAWDOWN_HALT_PCT", "0")),
+            correlation_filter_threshold=float(os.getenv("BOT_CORRELATION_FILTER_THRESHOLD", "0")),
+            ml_retrain_days=max(0, int(os.getenv("BOT_ML_RETRAIN_DAYS", "0"))),
+            ml_model_path=os.getenv("BOT_ML_MODEL_PATH", "models/ensemble.joblib"),
+            daily_summary_time=os.getenv("BOT_DAILY_SUMMARY_TIME", ""),
+            close_before_eod=max(0, int(os.getenv("BOT_CLOSE_BEFORE_EOD", "0"))),
+            gap_open_protection_pct=float(os.getenv("BOT_GAP_OPEN_PROTECTION_PCT", "0")),
+            dip_buy_enabled=os.getenv("BOT_DIP_BUY_ENABLED", "false").lower() == "true",
+            dip_rsi_threshold=float(os.getenv("BOT_DIP_RSI_THRESHOLD", "35")),
+            dip_drop_pct=float(os.getenv("BOT_DIP_DROP_PCT", "5")),
+            dip_lookback_days=max(5, int(os.getenv("BOT_DIP_LOOKBACK_DAYS", "20"))),
+            dip_long_ma_period=max(10, int(os.getenv("BOT_DIP_LONG_MA_PERIOD", "50"))),
+            dip_require_uptrend=os.getenv("BOT_DIP_REQUIRE_UPTREND", "true").lower() == "true",
+            partial_profit_trigger_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRIGGER_PCT", "0")),
+            partial_profit_sell_pct=max(1.0, min(99.0, float(os.getenv("BOT_PARTIAL_PROFIT_SELL_PCT", "50")))),
         )
 
     def validate(self) -> None:
@@ -125,6 +218,16 @@ class Settings:
             raise ValueError("max_portfolio_exposure_pct must be >0 and <=100.")
         if self.stop_loss_pct < 0 or self.stop_loss_pct > 50:
             raise ValueError("stop_loss_pct must be 0-50.")
+        if self.kelly_fraction <= 0 or self.kelly_fraction > 1:
+            raise ValueError("kelly_fraction must be in (0, 1].")
+        if self.trailing_stop_pct < 0 or self.trailing_stop_pct > 50:
+            raise ValueError("trailing_stop_pct must be 0-50.")
+
+    def get_symbols(self) -> list[str]:
+        """Return list of symbols to trade (multi-symbol or single)."""
+        if self.symbols:
+            return [s.strip().upper() for s in self.symbols.split(",") if s.strip()]
+        return [self.symbol.upper()]
 
     @property
     def is_live(self) -> bool:

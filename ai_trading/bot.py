@@ -8,8 +8,9 @@ from ai_trading.config import Settings
 from ai_trading.data.market_data import AlpacaMarketData
 from ai_trading.notifications.alerter import Notifier
 from ai_trading.risk.manager import RiskManager
+from ai_trading.risk.correlation import is_too_correlated
 from ai_trading.storage.journal import Journal, configure_logging
-from ai_trading.strategy.moving_average import moving_average_signal
+from ai_trading.strategy.moving_average import moving_average_signal, dip_buy_signal
 from ai_trading.strategy.sentiment_filter import apply_sentiment_filter
 
 
@@ -41,9 +42,11 @@ def _preflight_checks(settings: Settings, broker: AlpacaBroker, logger) -> bool:
     """Run pre-flight checks before trading. Returns True if all pass."""
     account = broker.account_state()
 
-    # Check account status
-    if account["status"] != "ACTIVE":
-        logger.error("Account status is %s, not ACTIVE. Aborting.", account["status"])
+    # Check account status (may be a string or an enum like AccountStatus.ACTIVE)
+    status = account["status"]
+    status_str = status.value if hasattr(status, "value") else str(status)
+    if status_str != "ACTIVE":
+        logger.error("Account status is %s, not ACTIVE. Aborting.", status_str)
         return False
 
     # Check if trading is restricted (PDT flag for live accounts)
@@ -51,6 +54,361 @@ def _preflight_checks(settings: Settings, broker: AlpacaBroker, logger) -> bool:
         logger.warning("Account flagged as pattern day trader. Proceed with caution.")
 
     return True
+
+
+def _maybe_retrain_ml(settings: Settings, symbol: str, logger) -> None:
+    """Retrain ML model if it's stale, per ml_retrain_days setting."""
+    if settings.ml_retrain_days <= 0:
+        return
+    try:
+        from ai_trading.ml.retrainer import should_retrain, retrain_model
+        if should_retrain(settings.ml_model_path, settings.ml_retrain_days):
+            retrain_model(
+                symbol=symbol,
+                model_path=settings.ml_model_path,
+                api_key=settings.api_key,
+                api_secret=settings.api_secret,
+            )
+    except Exception as exc:
+        logger.warning("ML retraining check failed: %s", exc)
+
+
+def _trade_symbol(
+    symbol: str,
+    settings: Settings,
+    broker: AlpacaBroker,
+    market_data: AlpacaMarketData,
+    risk: RiskManager,
+    journal: Journal,
+    notifier: Notifier,
+    logger,
+    account: dict,
+    all_bars: dict,
+    now: datetime,
+    market_is_open: bool = True,
+) -> None:
+    """Run one full trade cycle for a single symbol."""
+    bars = market_data.get_bars(symbol, settings.lookback_days, settings.bar_timeframe)
+    all_bars[symbol] = bars
+
+    signal = moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
+    position_qty = broker.position_qty(symbol)
+    has_open_order = broker.has_open_order(symbol)
+
+    # Buy-the-dip: override signal to BUY when RSI oversold + price pulled back
+    if (
+        settings.dip_buy_enabled
+        and position_qty == 0
+        and signal.signal != "BUY"
+    ):
+        dip = dip_buy_signal(
+            bars,
+            rsi_threshold=settings.dip_rsi_threshold,
+            drop_pct=settings.dip_drop_pct,
+            lookback_days=settings.dip_lookback_days,
+            long_ma_period=settings.dip_long_ma_period,
+            require_above_long_ma=settings.dip_require_uptrend,
+        )
+        if dip.signal == "BUY":
+            logger.info("Dip-buy triggered for %s: %s", symbol, dip.reason)
+            journal.write("dip_buy_signal", {
+                "symbol": symbol,
+                "rsi": round(dip.rsi, 2),
+                "drop_from_high_pct": round(dip.drop_from_high_pct, 2),
+                "above_long_ma": dip.above_long_ma,
+                "reason": dip.reason,
+            })
+            # Promote to BUY by patching the signal
+            from ai_trading.strategy.moving_average import SignalResult
+            signal = SignalResult("BUY", dip.close, signal.fast_ma, signal.slow_ma)
+
+    # Gap-open protection: if the first bar of the day gapped too far, skip new buys
+    # and optionally exit existing position
+    if settings.gap_open_protection_pct > 0 and len(bars) >= 2:
+        prior_close = float(bars["close"].iloc[-2])
+        current_price = float(bars["close"].iloc[-1])
+        gapped, gap_reason = risk.is_gap_open_too_large(
+            symbol, current_price, prior_close, settings.gap_open_protection_pct
+        )
+        if gapped:
+            logger.warning("Gap-open protection triggered for %s: %s", symbol, gap_reason)
+            journal.write("gap_open_protect", {"symbol": symbol, "reason": gap_reason,
+                                                "prior_close": prior_close, "current": current_price})
+            notifier.notify("risk_reject", f"Gap-open block [{symbol}]: {gap_reason}")
+            if position_qty > 0:
+                logger.info("Gap-open: closing existing position in %s", symbol)
+                broker.close_position(symbol)
+                risk.clear_trailing_peak(symbol)
+                journal.write("order", {"symbol": symbol, "action": "SELL", "qty": position_qty,
+                                        "reason": "gap-open protection", "mode": "PAPER" if settings.paper_only else "LIVE"})
+                notifier.notify("trade", f"Gap-open SELL {symbol}: {gap_reason}")
+            return  # skip normal signal logic for this bar
+
+    journal.write(
+        "signal",
+        {
+            "symbol": symbol,
+            "signal": signal.signal,
+            "close": signal.close,
+            "fast_ma": signal.fast_ma,
+            "slow_ma": signal.slow_ma,
+            "position_qty": position_qty,
+        },
+    )
+
+    # Partial profit taking: if up ≥ trigger %, sell sell_pct% of shares and hold the rest forever
+    if (
+        position_qty > 0
+        and settings.partial_profit_trigger_pct > 0
+        and not risk.has_partial_profit_taken(symbol)
+    ):
+        pos_detail = broker.position_details(symbol)
+        if pos_detail and pos_detail["unrealized_plpc"] * 100.0 >= settings.partial_profit_trigger_pct:
+            sell_qty = max(1, int(position_qty * settings.partial_profit_sell_pct / 100.0))
+            logger.info(
+                "Partial profit triggered for %s: up %.1f%%, selling %d/%d shares (%.0f%%)",
+                symbol,
+                pos_detail["unrealized_plpc"] * 100.0,
+                sell_qty,
+                position_qty,
+                settings.partial_profit_sell_pct,
+            )
+            try:
+                broker.submit_order(
+                    symbol, "SELL", sell_qty,
+                    order_type="market",
+                    max_retries=settings.max_api_retries,
+                )
+                risk.mark_partial_profit_taken(symbol)
+                journal.write("partial_profit", {
+                    "symbol": symbol,
+                    "unrealized_plpc": pos_detail["unrealized_plpc"],
+                    "sold_qty": sell_qty,
+                    "remaining_qty": position_qty - sell_qty,
+                    "trigger_pct": settings.partial_profit_trigger_pct,
+                    "sell_pct": settings.partial_profit_sell_pct,
+                })
+                notifier.notify(
+                    "trade",
+                    f"💰 Partial profit SELL {sell_qty} {symbol} "
+                    f"(+{pos_detail['unrealized_plpc']*100:.1f}% gain) — holding {position_qty - sell_qty} shares forever",
+                )
+            except Exception as exc:
+                logger.warning("Partial profit sell failed for %s: %s", symbol, exc)
+            return  # skip normal signal logic this cycle
+
+    # Trailing stop check — force SELL if trailing stop breached
+    # Skipped for symbols where partial profit was taken (remaining shares are lifetime holds)
+    if position_qty > 0 and settings.trailing_stop_pct > 0 and not risk.has_partial_profit_taken(symbol):
+        risk.update_trailing_peak(symbol, signal.close)
+        if risk.should_trail_stop(symbol, signal.close):
+            logger.info(
+                "Trailing stop triggered for %s at %.2f (peak %.2f, stop %.1f%%)",
+                symbol, signal.close,
+                risk._trailing_peaks.get(symbol, 0),
+                settings.trailing_stop_pct,
+            )
+            journal.write("trailing_stop_triggered", {"symbol": symbol, "price": signal.close})
+            notifier.notify("trade", f"Trailing stop triggered: SELL {symbol} at ${signal.close:.2f}")
+            # Force sell
+            effective_signal = "SELL"
+        else:
+            # Apply sentiment filter if enabled
+            effective_signal = _apply_sentiment(signal.signal, symbol, settings, journal, logger)
+    else:
+        effective_signal = _apply_sentiment(signal.signal, symbol, settings, journal, logger)
+
+    action = "HOLD"
+    requested_qty = settings.max_shares
+    if effective_signal == "BUY" and position_qty == 0:
+        if not market_is_open:
+            logger.info("Market closed — skipping BUY %s", symbol)
+            journal.write("market_closed_skip", {"symbol": symbol, "signal": "BUY"})
+            return
+        action = "BUY"
+
+        # Correlation filter: block if too correlated with existing positions
+        if settings.correlation_filter_threshold > 0:
+            existing_positions = [p["symbol"] for p in broker.all_positions()]
+            existing_with_bars = [s for s in existing_positions if s in all_bars]
+            if existing_with_bars:
+                blocked, reason = is_too_correlated(
+                    new_symbol=symbol,
+                    existing_symbols=existing_with_bars,
+                    bars_by_symbol=all_bars,
+                    threshold=settings.correlation_filter_threshold,
+                )
+                if blocked:
+                    logger.info("Correlation filter blocked BUY %s: %s", symbol, reason)
+                    journal.write("correlation_reject", {"symbol": symbol, "reason": reason})
+                    notifier.notify("risk_reject", f"Correlation filter: {reason}")
+                    return
+
+        # Kelly sizing
+        if settings.use_kelly_sizing:
+            requested_qty = risk.kelly_qty(
+                win_rate=0.52,   # Conservative default; replace with historical win rate
+                avg_win=0.015,
+                avg_loss=0.01,
+                equity=float(account["equity"]),
+                price=signal.close,
+            )
+        else:
+            requested_qty = settings.max_shares
+
+    elif effective_signal == "SELL" and position_qty > 0:
+        action = "SELL"
+        requested_qty = position_qty
+
+    if action == "HOLD":
+        logger.info("No action for %s: signal=%s position=%s", symbol, signal.signal, position_qty)
+        journal.write("decision", {"symbol": symbol, "action": "HOLD", "reason": "signal/position rules"})
+        risk.clear_error_streak()
+        return
+
+    decision = risk.evaluate(
+        today=now.date(),
+        paper_mode=broker.paper,
+        market_open=broker.is_market_open(),
+        cash=float(account["cash"]),
+        has_open_order=has_open_order,
+        side=action,
+        requested_qty=requested_qty,
+        current_position_qty=position_qty,
+        equity=float(account["equity"]),
+        last_equity=float(account.get("last_equity", 0)),
+        portfolio_value=float(account.get("portfolio_value", 0)),
+    )
+
+    if not decision.allowed:
+        logger.info("Risk manager rejected %s %s: %s", action, symbol, decision.reason)
+        journal.write("risk_reject", {"symbol": symbol, "action": action, "reason": decision.reason})
+        notifier.notify("risk_reject", f"Order rejected [{symbol}]: {decision.reason}")
+        return
+
+    # Drawdown alert (informational — doesn't block, halt is handled in evaluate())
+    if settings.portfolio_drawdown_halt_pct > 0 and risk._peak_equity > 0:
+        equity = float(account["equity"])
+        drawdown = (risk._peak_equity - equity) / risk._peak_equity * 100.0
+        if drawdown >= settings.portfolio_drawdown_halt_pct * 0.75:  # warn at 75% of limit
+            notifier.send_drawdown_alert(drawdown, equity, risk._peak_equity)
+
+    if not _confirm_live_trade(settings, action, symbol, decision.approved_qty):
+        logger.info("Order cancelled by user confirmation.")
+        journal.write("user_cancel", {"symbol": symbol, "action": action, "reason": "confirmation denied"})
+        return
+
+    limit_price = None
+    if settings.order_type == "limit":
+        offset_mult = 1 + (settings.limit_price_offset_pct / 100.0)
+        if action == "BUY":
+            limit_price = signal.close * offset_mult
+        else:
+            limit_price = signal.close * (1 - settings.limit_price_offset_pct / 100.0)
+
+    order = broker.submit_order(
+        symbol,
+        action,
+        decision.approved_qty,
+        order_type=settings.order_type,
+        limit_price=limit_price,
+        max_retries=settings.max_api_retries,
+    )
+
+    risk.register_trade(now.date())
+    risk.clear_error_streak()
+
+    # Update trailing peak on BUY
+    if action == "BUY":
+        risk.update_trailing_peak(symbol, signal.close)
+    elif action == "SELL":
+        risk.clear_trailing_peak(symbol)
+        risk.clear_partial_profit(symbol)
+
+    order_record = {
+        "symbol": symbol,
+        "action": action,
+        "qty": decision.approved_qty,
+        "order_id": str(order.id),
+        "order_type": settings.order_type,
+        "limit_price": limit_price,
+        "mode": "LIVE" if settings.is_live else "PAPER",
+    }
+
+    logger.info(
+        "Submitted %s %s order %s qty=%s",
+        "LIVE" if settings.is_live else "PAPER",
+        action, order.id, decision.approved_qty,
+    )
+    journal.write("order", order_record)
+    notifier.notify(
+        "trade",
+        f"{'LIVE' if settings.is_live else 'PAPER'} {action} {decision.approved_qty} {symbol} @ ${signal.close:.2f}",
+        order_record,
+    )
+
+    if settings.order_fill_timeout_sec > 0:
+        fill_result = broker.wait_for_fill(
+            str(order.id), timeout_sec=settings.order_fill_timeout_sec
+        )
+        journal.write("fill_status", fill_result)
+        if fill_result["status"] == "filled":
+            logger.info(
+                "Order filled: qty=%s avg_price=%.2f",
+                fill_result["filled_qty"],
+                fill_result["filled_avg_price"],
+            )
+        elif fill_result["status"] == "timeout":
+            logger.warning("Order fill timed out after %ds", settings.order_fill_timeout_sec)
+            notifier.notify("error", f"Order fill timeout: {order.id}")
+        else:
+            logger.warning("Order status: %s", fill_result["status"])
+
+        if (
+            settings.stop_loss_pct > 0
+            and action == "BUY"
+            and fill_result["status"] == "filled"
+            and fill_result["filled_avg_price"] > 0
+        ):
+            stop_price = fill_result["filled_avg_price"] * (1 - settings.stop_loss_pct / 100.0)
+            try:
+                sl_order = broker.submit_stop_loss(symbol, fill_result["filled_qty"], stop_price)
+                journal.write(
+                    "stop_loss",
+                    {"order_id": str(sl_order.id), "stop_price": stop_price, "qty": fill_result["filled_qty"]},
+                )
+            except Exception as sl_exc:
+                logger.warning("Failed to place stop-loss for %s: %s", symbol, sl_exc)
+
+
+def _apply_sentiment(signal_value: str, symbol: str, settings: Settings, journal: Journal, logger) -> str:
+    """Apply sentiment filter and return effective signal."""
+    if not settings.use_sentiment_filter or signal_value == "HOLD":
+        return signal_value
+    keywords = [k.strip() for k in settings.news_keywords.split(",") if k.strip()] or None
+    sentiment_result = apply_sentiment_filter(
+        signal=signal_value,
+        symbol=symbol,
+        buy_threshold=settings.sentiment_buy_threshold,
+        sell_threshold=settings.sentiment_sell_threshold,
+        provider=settings.news_provider,
+        api_key=settings.news_api_key,
+        keywords=keywords,
+    )
+    journal.write(
+        "sentiment_filter",
+        {
+            "symbol": symbol,
+            "original_signal": sentiment_result.original_signal,
+            "filtered_signal": sentiment_result.filtered_signal,
+            "sentiment_score": sentiment_result.sentiment_score,
+            "blocked": sentiment_result.blocked,
+            "reason": sentiment_result.reason,
+        },
+    )
+    if sentiment_result.blocked:
+        logger.info("Sentiment filter blocked %s for %s: %s", signal_value, symbol, sentiment_result.reason)
+    return sentiment_result.filtered_signal
 
 
 def run_once(symbol_override: str | None = None, skip_confirmation: bool = False) -> None:
@@ -84,205 +442,110 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         max_portfolio_exposure_pct=settings.max_portfolio_exposure_pct,
         min_equity=settings.min_equity,
         trade_cooldown_sec=settings.trade_cooldown_sec,
+        portfolio_drawdown_halt_pct=settings.portfolio_drawdown_halt_pct,
+        use_kelly_sizing=settings.use_kelly_sizing,
+        kelly_fraction=settings.kelly_fraction,
+        kelly_max_shares=settings.kelly_max_shares,
+        trailing_stop_pct=settings.trailing_stop_pct,
     )
 
     now = datetime.now(timezone.utc)
 
     try:
-        # Pre-flight checks
         if not _preflight_checks(settings, broker, logger):
             journal.write("preflight_failed", {"reason": "account not ready"})
             notifier.notify("error", "Pre-flight check failed: account not ready")
             return
 
+        # Market-hours gate: when the market is closed, skip everything.
+        # No signals, no notifications, no orders — nothing to do until market opens.
+        market_is_open = broker.is_market_open()
+        if not market_is_open:
+            logger.info("Market is closed — skipping cycle entirely.")
+            return
+
         account = broker.account_state()
         journal.write("account_state", account)
 
-        bars = market_data.get_daily_bars(settings.symbol, settings.lookback_days)
-        signal = moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
-        position_qty = broker.position_qty(settings.symbol)
-        has_open_order = broker.has_open_order(settings.symbol)
+        cfg_symbols = settings.get_symbols()
+        # If no explicit symbol list configured, pull the full tradable universe
+        # from Alpaca (NYSE + NASDAQ + ARCA + BATS + AMEX, clean tickers only).
+        if len(cfg_symbols) == 1 and cfg_symbols[0] == settings.symbol.upper() and not settings.symbols:
+            symbols = broker.get_all_tradable_symbols()
+        else:
+            symbols = cfg_symbols
+        logger.info("Trading %d symbols", len(symbols))
 
-        journal.write(
-            "signal",
-            {
-                "symbol": settings.symbol,
-                "signal": signal.signal,
-                "close": signal.close,
-                "fast_ma": signal.fast_ma,
-                "slow_ma": signal.slow_ma,
-                "position_qty": position_qty,
-            },
-        )
-
-        # Apply sentiment filter if enabled
-        effective_signal = signal.signal
-        if settings.use_sentiment_filter and signal.signal != "HOLD":
-            keywords = [k.strip() for k in settings.news_keywords.split(",") if k.strip()] or None
-            sentiment_result = apply_sentiment_filter(
-                signal=signal.signal,
-                symbol=settings.symbol,
-                buy_threshold=settings.sentiment_buy_threshold,
-                sell_threshold=settings.sentiment_sell_threshold,
-                provider=settings.news_provider,
-                api_key=settings.news_api_key,
-                keywords=keywords,
-            )
-            effective_signal = sentiment_result.filtered_signal
-            journal.write(
-                "sentiment_filter",
-                {
-                    "original_signal": sentiment_result.original_signal,
-                    "filtered_signal": sentiment_result.filtered_signal,
-                    "sentiment_score": sentiment_result.sentiment_score,
-                    "blocked": sentiment_result.blocked,
-                    "reason": sentiment_result.reason,
-                },
-            )
-            if sentiment_result.blocked:
+        # EOD forced close: if within N minutes of market close, liquidate all positions
+        if settings.close_before_eod > 0:
+            mins_left = broker.minutes_to_close()
+            if 0 < mins_left <= settings.close_before_eod:
                 logger.info(
-                    "Sentiment filter blocked %s: %s",
-                    signal.signal,
-                    sentiment_result.reason,
+                    "EOD close triggered: %.1f min until close (threshold %d min)",
+                    mins_left, settings.close_before_eod,
                 )
+                for pos in broker.all_positions():
+                    sym = pos["symbol"]
+                    try:
+                        broker.close_position(sym)
+                        risk.clear_trailing_peak(sym)
+                        journal.write("order", {"symbol": sym, "action": "SELL",
+                                                "qty": pos["qty"], "reason": "EOD close",
+                                                "mode": "PAPER" if settings.paper_only else "LIVE"})
+                        logger.info("EOD closed %s (%s shares)", sym, pos["qty"])
+                        notifier.notify("trade", f"EOD close: SELL {pos['qty']} {sym} ({mins_left:.0f} min to close)")
+                    except Exception as exc:
+                        logger.error("EOD close failed for %s: %s", sym, exc)
+                return  # skip normal signal logic today
 
-        action = "HOLD"
-        requested_qty = 0
-        if effective_signal == "BUY" and position_qty == 0:
-            action = "BUY"
-            requested_qty = settings.max_shares
-        elif effective_signal == "SELL" and position_qty > 0:
-            action = "SELL"
-            requested_qty = position_qty
+        # Optionally retrain ML model before trading
+        for sym in symbols:
+            _maybe_retrain_ml(settings, sym, logger)
 
-        if action == "HOLD":
-            logger.info("No action taken: signal=%s position=%s", signal.signal, position_qty)
-            journal.write("decision", {"action": "HOLD", "reason": "signal/position rules"})
-            risk.clear_error_streak()
-            return
+        # Fetch bars for all symbols (used by correlation filter too)
+        all_bars: dict = {}
 
-        decision = risk.evaluate(
-            today=now.date(),
-            paper_mode=broker.paper,
-            market_open=broker.is_market_open(),
-            cash=float(account["cash"]),
-            has_open_order=has_open_order,
-            side=action,
-            requested_qty=requested_qty,
-            current_position_qty=position_qty,
-            equity=float(account["equity"]),
-            last_equity=float(account.get("last_equity", 0)),
-            portfolio_value=float(account.get("portfolio_value", 0)),
-        )
+        for symbol in symbols:
+            try:
+                _trade_symbol(
+                    symbol=symbol,
+                    settings=settings,
+                    broker=broker,
+                    market_data=market_data,
+                    risk=risk,
+                    journal=journal,
+                    notifier=notifier,
+                    logger=logger,
+                    account=account,
+                    all_bars=all_bars,
+                    now=now,
+                    market_is_open=market_is_open,
+                )
+            except OrderError as exc:
+                risk.register_error()
+                logger.error("Order error [%s]: %s", symbol, exc)
+                journal.write("order_error", {"symbol": symbol, "error": str(exc)})
+                notifier.notify("error", f"Order error [{symbol}]: {exc}")
+            except Exception as exc:
+                risk.register_error()
+                logger.exception("Error trading %s: %s", symbol, exc)
+                journal.write("error", {"symbol": symbol, "error": str(exc)})
+                notifier.notify("error", f"Bot error [{symbol}]: {exc}")
 
-        if not decision.allowed:
-            logger.info("Risk manager rejected order: %s", decision.reason)
-            journal.write("risk_reject", {"action": action, "reason": decision.reason})
-            notifier.notify("risk_reject", f"Order rejected: {decision.reason}")
-            return
-
-        # Confirmation for live trading
-        if not _confirm_live_trade(settings, action, settings.symbol, decision.approved_qty):
-            logger.info("Order cancelled by user confirmation.")
-            journal.write("user_cancel", {"action": action, "reason": "confirmation denied"})
-            return
-
-        # Determine limit price if using limit orders
-        limit_price = None
-        if settings.order_type == "limit":
-            offset_mult = 1 + (settings.limit_price_offset_pct / 100.0)
-            if action == "BUY":
-                # Place limit slightly above current price to improve fill chance
-                limit_price = signal.close * offset_mult
-            else:
-                # Place limit slightly below current price (mirror of buy offset)
-                limit_price = signal.close * (1 - settings.limit_price_offset_pct / 100.0)
-
-        # Submit order with retry logic
-        order = broker.submit_order(
-            settings.symbol,
-            action,
-            decision.approved_qty,
-            order_type=settings.order_type,
-            limit_price=limit_price,
-            max_retries=settings.max_api_retries,
-        )
-
-        risk.register_trade(now.date())
-        risk.clear_error_streak()
-
-        order_record = {
-            "symbol": settings.symbol,
-            "action": action,
-            "qty": decision.approved_qty,
-            "order_id": str(order.id),
-            "order_type": settings.order_type,
-            "limit_price": limit_price,
-            "mode": "LIVE" if settings.is_live else "PAPER",
-        }
-
-        logger.info(
-            "Submitted %s %s order %s qty=%s",
-            "LIVE" if settings.is_live else "PAPER",
-            action,
-            order.id,
-            decision.approved_qty,
-        )
-        journal.write("order", order_record)
-        notifier.notify(
-            "trade",
-            f"{'LIVE' if settings.is_live else 'PAPER'} {action} {decision.approved_qty} {settings.symbol}",
-            order_record,
-        )
-
-        # Wait for fill if configured
-        if settings.order_fill_timeout_sec > 0:
-            fill_result = broker.wait_for_fill(
-                str(order.id), timeout_sec=settings.order_fill_timeout_sec
+        # Daily summary notification
+        if "daily_summary" in settings.notify_events:
+            equity = float(account["equity"])
+            last_equity = float(account.get("last_equity", equity))
+            positions = broker.all_positions()
+            notifier.send_daily_summary(
+                date=now.strftime("%Y-%m-%d"),
+                equity=equity,
+                last_equity=last_equity,
+                positions=positions,
+                trades_today=risk._trades_today,
+                pnl_today=equity - last_equity,
             )
-            journal.write("fill_status", fill_result)
-            if fill_result["status"] == "filled":
-                logger.info(
-                    "Order filled: qty=%s avg_price=%.2f",
-                    fill_result["filled_qty"],
-                    fill_result["filled_avg_price"],
-                )
-            elif fill_result["status"] == "timeout":
-                logger.warning("Order fill timed out after %ds", settings.order_fill_timeout_sec)
-                notifier.notify("error", f"Order fill timeout: {order.id}")
-            else:
-                logger.warning("Order status: %s", fill_result["status"])
 
-            # Place stop-loss if configured and order was a BUY that filled
-            if (
-                settings.stop_loss_pct > 0
-                and action == "BUY"
-                and fill_result["status"] == "filled"
-                and fill_result["filled_avg_price"] > 0
-            ):
-                stop_price = fill_result["filled_avg_price"] * (
-                    1 - settings.stop_loss_pct / 100.0
-                )
-                try:
-                    sl_order = broker.submit_stop_loss(
-                        settings.symbol, fill_result["filled_qty"], stop_price
-                    )
-                    journal.write(
-                        "stop_loss",
-                        {
-                            "order_id": str(sl_order.id),
-                            "stop_price": stop_price,
-                            "qty": fill_result["filled_qty"],
-                        },
-                    )
-                except Exception as sl_exc:
-                    logger.warning("Failed to place stop-loss: %s", sl_exc)
-
-    except OrderError as exc:
-        risk.register_error()
-        logger.error("Order error: %s", exc)
-        journal.write("order_error", {"error": str(exc)})
-        notifier.notify("error", f"Order error: {exc}")
     except Exception as exc:
         risk.register_error()
         logger.exception("Bot run failed: %s", exc)

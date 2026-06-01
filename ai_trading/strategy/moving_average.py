@@ -13,6 +13,28 @@ class SignalResult:
     slow_ma: float
 
 
+@dataclass(slots=True)
+class DipSignalResult:
+    signal: str        # "BUY" or "HOLD"
+    close: float
+    rsi: float
+    drop_from_high_pct: float   # how far price fell from recent high
+    above_long_ma: bool
+    reason: str
+
+
+def _compute_rsi(closes: pd.Series, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi_series = 100 - (100 / (1 + rs))
+    val = rsi_series.iloc[-1]
+    return float(val) if pd.notna(val) else 50.0
+
+
 def moving_average_signal(bars: pd.DataFrame, fast: int, slow: int) -> SignalResult:
     closes = bars["close"].astype(float)
     fast_ma = closes.rolling(fast).mean()
@@ -29,3 +51,60 @@ def moving_average_signal(bars: pd.DataFrame, fast: int, slow: int) -> SignalRes
     if latest_fast < latest_slow:
         return SignalResult("SELL", close, latest_fast, latest_slow)
     return SignalResult("HOLD", close, latest_fast, latest_slow)
+
+
+def dip_buy_signal(
+    bars: pd.DataFrame,
+    rsi_threshold: float = 35.0,
+    drop_pct: float = 5.0,
+    lookback_days: int = 20,
+    long_ma_period: int = 50,
+    require_above_long_ma: bool = True,
+) -> DipSignalResult:
+    """Buy-the-dip signal: fires when a stock has pulled back meaningfully
+    from a recent high while remaining in a longer-term uptrend.
+
+    Conditions (ALL must be true):
+    1. RSI(14) <= rsi_threshold  → oversold / washed out
+    2. Price dropped >= drop_pct % from the N-day high → actual dip
+    3. (optional) Price still above long_ma_period MA → don't buy falling knives
+
+    Returns DipSignalResult with signal="BUY" when all conditions pass.
+    """
+    if len(bars) < max(lookback_days, long_ma_period, 15):
+        return DipSignalResult("HOLD", 0.0, 50.0, 0.0, True, "insufficient data")
+
+    closes = bars["close"].astype(float)
+    close = float(closes.iloc[-1])
+
+    # RSI
+    rsi = _compute_rsi(closes)
+
+    # Drop from recent high
+    recent_high = float(closes.iloc[-lookback_days:].max())
+    drop_from_high_pct = (recent_high - close) / recent_high * 100.0 if recent_high > 0 else 0.0
+
+    # Long-term trend MA
+    long_ma_series = closes.rolling(long_ma_period).mean()
+    long_ma_val = float(long_ma_series.iloc[-1]) if pd.notna(long_ma_series.iloc[-1]) else close
+    above_long_ma = close >= long_ma_val
+
+    # Evaluate conditions
+    rsi_ok = rsi <= rsi_threshold
+    dip_ok = drop_from_high_pct >= drop_pct
+    trend_ok = above_long_ma or not require_above_long_ma
+
+    if rsi_ok and dip_ok and trend_ok:
+        reason = (
+            f"dip buy: RSI={rsi:.1f}≤{rsi_threshold}, "
+            f"down {drop_from_high_pct:.1f}% from {lookback_days}d high, "
+            f"{'above' if above_long_ma else 'below'} {long_ma_period}MA"
+        )
+        return DipSignalResult("BUY", close, rsi, drop_from_high_pct, above_long_ma, reason)
+
+    reasons = []
+    if not rsi_ok:   reasons.append(f"RSI={rsi:.1f}>{rsi_threshold}")
+    if not dip_ok:   reasons.append(f"drop={drop_from_high_pct:.1f}%<{drop_pct}%")
+    if not trend_ok: reasons.append(f"below {long_ma_period}MA")
+    return DipSignalResult("HOLD", close, rsi, drop_from_high_pct, above_long_ma, "; ".join(reasons))
+

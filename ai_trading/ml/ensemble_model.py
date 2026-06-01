@@ -535,3 +535,46 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# EnsembleModel class — convenient wrapper for save/load/predict
+# ---------------------------------------------------------------------------
+
+
+# Alias for backwards compat
+build_features = build_advanced_features
+
+
+class EnsembleModel:
+    """Wrapper around the sklearn ensemble pipeline with save/load support."""
+
+    def __init__(self) -> None:
+        self._pipeline = None
+
+    def fit(self, features_and_target) -> None:
+        """Fit from a tuple (X, y) or a DataFrame with 'target' column."""
+        if isinstance(features_and_target, tuple):
+            X, y = features_and_target
+        else:
+            y = features_and_target["target"]
+            X = features_and_target[FEATURE_COLUMNS]
+        self._pipeline = train_ensemble(X, y, calibrate=True)
+
+    def predict_proba_up(self, bars: "pd.DataFrame") -> float:
+        """Return probability of next-day UP move from OHLCV bars."""
+        if self._pipeline is None:
+            raise RuntimeError("Model not trained. Call fit() first.")
+        X, _ = build_advanced_features(bars)
+        if X.empty:
+            return 0.5
+        return float(self._pipeline.predict_proba(X.iloc[[-1]])[0][1])
+
+    def save(self, path: str) -> None:
+        joblib.dump(self._pipeline, path)
+
+    @classmethod
+    def load(cls, path: str) -> "EnsembleModel":
+        m = cls()
+        m._pipeline = joblib.load(path)
+        return m

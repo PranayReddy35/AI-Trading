@@ -37,20 +37,28 @@ class Notifier:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         full_message = f"[{ts}] [{event_type.upper()}] {message}"
 
-        # Build payload compatible with Slack/Discord/generic webhooks
-        body = {
-            "text": full_message,  # Slack format
-            "content": full_message,  # Discord format
-        }
+        # Discord uses "content"; Slack uses "text". Include both for compatibility.
+        # Append payload as a code block if provided (avoids Slack-specific "attachments")
         if payload:
-            body["attachments"] = [{"text": json.dumps(payload, default=str)}]
+            payload_str = json.dumps(payload, default=str, indent=2)
+            # Truncate to stay within Discord's 2000-char limit
+            if len(full_message) + len(payload_str) < 1800:
+                full_message = f"{full_message}\n```json\n{payload_str}\n```"
+
+        body = {
+            "content": full_message[:2000],  # Discord 2000-char limit
+            "text": full_message[:2000],      # Slack fallback
+        }
 
         try:
             data = json.dumps(body).encode("utf-8")
             req = Request(
                 self.webhook_url,
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
                 method="POST",
             )
             with urlopen(req, timeout=10) as resp:
@@ -64,3 +72,65 @@ class Notifier:
         except Exception as exc:
             logger.warning("Unexpected notification error: %s", exc)
             return False
+
+    def send_daily_summary(
+        self,
+        *,
+        date: str,
+        equity: float,
+        last_equity: float,
+        positions: list[dict],
+        trades_today: int,
+        pnl_today: float,
+    ) -> bool:
+        """Send a daily portfolio summary to Discord."""
+        if not self.enabled or "daily_summary" not in self.notify_events:
+            return False
+
+        pnl_sign = "+" if pnl_today >= 0 else ""
+        lines = [
+            f"**Daily Summary — {date}**",
+            f"Equity: ${equity:,.2f}  (${pnl_sign}{pnl_today:,.2f} / {pnl_sign}{(pnl_today/last_equity*100) if last_equity else 0:.2f}%)",
+            f"Trades today: {trades_today}",
+        ]
+        if positions:
+            lines.append("**Open Positions:**")
+            for p in positions:
+                pl = p.get("unrealized_pl", 0)
+                pl_sign = "+" if pl >= 0 else ""
+                lines.append(
+                    f"  {p['symbol']}: {p['qty']} shares  P&L {pl_sign}${pl:.2f}"
+                )
+        else:
+            lines.append("No open positions.")
+
+        message = "\n".join(lines)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        body = {
+            "content": f"[{ts}] [DAILY_SUMMARY]\n{message}",
+            "text": f"[{ts}] [DAILY_SUMMARY]\n{message}",
+        }
+        try:
+            data = json.dumps(body).encode("utf-8")
+            req = Request(
+                self.webhook_url,
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                method="POST",
+            )
+            with urlopen(req, timeout=10) as resp:
+                return 200 <= resp.status < 300
+        except Exception as exc:
+            logger.warning("Daily summary notification failed: %s", exc)
+            return False
+
+    def send_drawdown_alert(self, drawdown_pct: float, equity: float, peak_equity: float) -> bool:
+        """Send a drawdown alert notification."""
+        if not self.enabled or "drawdown" not in self.notify_events:
+            return False
+        message = (
+            f"⚠️ Portfolio drawdown alert: {drawdown_pct:.2f}% from peak "
+            f"(equity ${equity:,.2f} vs peak ${peak_equity:,.2f})"
+        )
+        return self.notify("drawdown", message)
+

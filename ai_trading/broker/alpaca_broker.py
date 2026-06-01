@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
+    GetAssetsRequest,
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
@@ -28,10 +30,60 @@ class AlpacaBroker:
     def is_market_open(self) -> bool:
         return bool(self.client.get_clock().is_open)
 
+    def minutes_to_close(self) -> float:
+        """Return minutes until market close. Negative if market is closed."""
+        from datetime import datetime, timezone
+        clock = self.client.get_clock()
+        if not clock.is_open:
+            return -1.0
+        now = datetime.now(timezone.utc)
+        close = clock.next_close.replace(tzinfo=timezone.utc) if clock.next_close.tzinfo is None else clock.next_close
+        return (close - now).total_seconds() / 60.0
+
+    def get_all_tradable_symbols(self) -> list[str]:
+        """Return all active tradable US equity symbols from major exchanges.
+
+        Filters: active + tradable + NYSE/NASDAQ/ARCA/BATS/AMEX + clean ticker
+        (1-5 uppercase letters only — excludes warrants, preferred shares, ETPs
+        with dots/dashes). Result is cached on the instance for the lifetime of
+        the process so the API is only called once per bot run.
+        """
+        if hasattr(self, "_tradable_symbols_cache"):
+            return self._tradable_symbols_cache  # type: ignore[attr-defined]
+
+        _MAIN_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "BATS", "AMEX"}
+        _CLEAN_TICKER = re.compile(r"^[A-Z]{1,5}$")
+
+        logger.info("Fetching full tradable universe from Alpaca...")
+        req = GetAssetsRequest(
+            asset_class=AssetClass.US_EQUITY,
+            status=AssetStatus.ACTIVE,
+        )
+        assets = self.client.get_all_assets(req)
+        symbols = [
+            a.symbol
+            for a in assets
+            if a.tradable
+            and a.exchange.value in _MAIN_EXCHANGES
+            and _CLEAN_TICKER.match(a.symbol)
+        ]
+        symbols.sort()
+        logger.info("Tradable universe: %d symbols", len(symbols))
+        self._tradable_symbols_cache: list[str] = symbols
+        return symbols
+
+    def close_position(self, symbol: str) -> None:
+        """Market-sell an entire position for a symbol."""
+        try:
+            self.client.close_position(symbol)
+            logger.info("Closed position: %s", symbol)
+        except Exception as exc:
+            logger.warning("Failed to close position %s: %s", symbol, exc)
+
     def account_state(self) -> dict:
         account = self.client.get_account()
         return {
-            "status": str(account.status),
+            "status": account.status.value if hasattr(account.status, "value") else str(account.status),
             "cash": float(account.cash),
             "buying_power": float(account.buying_power),
             "equity": float(account.equity),
