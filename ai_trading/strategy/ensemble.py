@@ -380,12 +380,19 @@ def compute_ensemble_signal(
     regime_state = detect_regime(bars)
     regime = regime_state.regime
 
-    # Get individual strategy signals
-    signals: list[StrategySignal] = [
-        trend_following_signal(bars),
-        mean_reversion_signal(bars),
-        momentum_signal(bars),
+    # Get individual strategy signals with error isolation
+    signals: list[StrategySignal] = []
+    _strategy_funcs = [
+        ("trend", trend_following_signal),
+        ("mean_reversion", mean_reversion_signal),
+        ("momentum", momentum_signal),
     ]
+    for name, func in _strategy_funcs:
+        try:
+            signals.append(func(bars))
+        except Exception as exc:
+            logger.warning("Strategy '%s' failed (returning neutral): %s", name, exc)
+            signals.append(StrategySignal(name, 0.0, 0.0, f"error: {exc}"))
 
     # Add ML signal if available
     if ml_probability is not None:

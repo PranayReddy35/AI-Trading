@@ -165,7 +165,10 @@ class AlpacaBroker:
         limit_price: float | None = None,
         max_retries: int = 3,
     ) -> Any:
-        """Submit an order with retry logic for transient failures."""
+        """Submit an order with retry logic for transient failures.
+
+        Includes specialized rate-limit handling (HTTP 429) with longer backoff.
+        """
         order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
 
         for attempt in range(1, max_retries + 1):
@@ -196,12 +199,21 @@ class AlpacaBroker:
                     raise OrderError(
                         f"Order failed after {max_retries} attempts: {exc}"
                     ) from exc
-                # Exponential backoff: 2s, 4s, 8s (capped at 8s)
-                wait = min(2 ** attempt, 8)
-                logger.warning(
-                    "Order attempt %d/%d failed (%s), retrying in %ds...",
-                    attempt, max_retries, exc, wait,
-                )
+                # Rate limit detection (#10): check for 429 status
+                exc_str = str(exc).lower()
+                if "429" in exc_str or "rate limit" in exc_str or "too many requests" in exc_str:
+                    wait = min(30, 10 * attempt)  # Longer backoff for rate limits
+                    logger.warning(
+                        "Rate limited on attempt %d/%d, waiting %ds...",
+                        attempt, max_retries, wait,
+                    )
+                else:
+                    # Exponential backoff: 2s, 4s, 8s (capped at 8s)
+                    wait = min(2 ** attempt, 8)
+                    logger.warning(
+                        "Order attempt %d/%d failed (%s), retrying in %ds...",
+                        attempt, max_retries, exc, wait,
+                    )
                 time.sleep(wait)
 
     def submit_stop_loss(
@@ -223,30 +235,60 @@ class AlpacaBroker:
         return order
 
     def wait_for_fill(self, order_id: str, timeout_sec: int = 60) -> dict:
-        """Poll order status until filled or timeout. Returns order state."""
+        """Poll order status until filled or timeout. Returns order state.
+
+        Properly handles partial fills: if the order is partially filled when
+        timeout is reached, reports the partial fill status so the caller can
+        decide whether to cancel the remainder.
+        """
         deadline = time.time() + timeout_sec
+        last_status = "pending"
+        last_filled_qty = 0
         while time.time() < deadline:
             order = self.client.get_order_by_id(order_id)
             status = str(order.status)
-            if status in ("filled", "partially_filled"):
-                filled_qty = int(float(order.filled_qty)) if order.filled_qty else 0
-                filled_avg_price = (
-                    float(order.filled_avg_price) if order.filled_avg_price else 0.0
-                )
+            filled_qty = int(float(order.filled_qty)) if order.filled_qty else 0
+            filled_avg_price = (
+                float(order.filled_avg_price) if order.filled_avg_price else 0.0
+            )
+            last_status = status
+            last_filled_qty = filled_qty
+
+            if status == "filled":
+                return {
+                    "status": "filled",
+                    "filled_qty": filled_qty,
+                    "filled_avg_price": filled_avg_price,
+                    "order_id": str(order.id),
+                }
+            if status == "partially_filled":
+                # Continue waiting — it may fill completely
+                pass
+            if status in ("cancelled", "expired", "rejected", "suspended"):
                 return {
                     "status": status,
                     "filled_qty": filled_qty,
                     "filled_avg_price": filled_avg_price,
                     "order_id": str(order.id),
                 }
-            if status in ("cancelled", "expired", "rejected", "suspended"):
-                return {
-                    "status": status,
-                    "filled_qty": 0,
-                    "filled_avg_price": 0.0,
-                    "order_id": str(order.id),
-                }
             time.sleep(2)
+
+        # Timeout reached — check final state for partial fills
+        try:
+            order = self.client.get_order_by_id(order_id)
+            last_status = str(order.status)
+            last_filled_qty = int(float(order.filled_qty)) if order.filled_qty else 0
+            filled_avg_price = float(order.filled_avg_price) if order.filled_avg_price else 0.0
+        except Exception:
+            filled_avg_price = 0.0
+
+        if last_filled_qty > 0:
+            return {
+                "status": "partially_filled",
+                "filled_qty": last_filled_qty,
+                "filled_avg_price": filled_avg_price,
+                "order_id": order_id,
+            }
 
         return {
             "status": "timeout",
@@ -254,6 +296,16 @@ class AlpacaBroker:
             "filled_avg_price": 0.0,
             "order_id": order_id,
         }
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a specific order by ID. Returns True if cancelled successfully."""
+        try:
+            self.client.cancel_order_by_id(order_id)
+            logger.info("Cancelled order: %s", order_id)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to cancel order %s: %s", order_id, exc)
+            return False
 
     def get_latest_price(self, symbol: str) -> float:
         """Get latest trade price for a symbol."""

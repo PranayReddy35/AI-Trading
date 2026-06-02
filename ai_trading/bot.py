@@ -11,7 +11,10 @@ from ai_trading.risk.manager import RiskManager
 from ai_trading.risk.correlation import is_too_correlated
 from ai_trading.storage.journal import Journal, configure_logging
 from ai_trading.strategy.moving_average import moving_average_signal, dip_buy_signal
-from ai_trading.strategy.sentiment_filter import apply_sentiment_filter
+from ai_trading.strategy.sentiment_filter import apply_sentiment_filter, configure_sentiment_cache
+
+import logging
+from pathlib import Path
 
 
 LIVE_WARNING = (
@@ -91,7 +94,12 @@ def _trade_symbol(
     bars = market_data.get_bars(symbol, settings.lookback_days, settings.bar_timeframe)
     all_bars[symbol] = bars
 
-    signal = moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
+    # Generate signal based on strategy_mode
+    if settings.strategy_mode == "ensemble":
+        signal = _ensemble_signal(bars, symbol, settings, journal, logger)
+    else:
+        signal = moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
+
     position_qty = broker.position_qty(symbol)
     has_open_order = broker.has_open_order(symbol)
 
@@ -156,7 +164,7 @@ def _trade_symbol(
         },
     )
 
-    # Partial profit taking: if up ≥ trigger %, sell sell_pct% of shares and hold the rest forever
+    # Partial profit taking: if up ≥ trigger %, sell sell_pct% of shares and hold the rest
     if (
         position_qty > 0
         and settings.partial_profit_trigger_pct > 0
@@ -179,7 +187,8 @@ def _trade_symbol(
                     order_type="market",
                     max_retries=settings.max_api_retries,
                 )
-                risk.mark_partial_profit_taken(symbol)
+                entry_price = float(pos_detail.get("avg_entry_price", 0))
+                risk.mark_partial_profit_taken(symbol, entry_price=entry_price)
                 journal.write("partial_profit", {
                     "symbol": symbol,
                     "unrealized_plpc": pos_detail["unrealized_plpc"],
@@ -191,14 +200,37 @@ def _trade_symbol(
                 notifier.notify(
                     "trade",
                     f"💰 Partial profit SELL {sell_qty} {symbol} "
-                    f"(+{pos_detail['unrealized_plpc']*100:.1f}% gain) — holding {position_qty - sell_qty} shares forever",
+                    f"(+{pos_detail['unrealized_plpc']*100:.1f}% gain) — holding {position_qty - sell_qty} shares",
                 )
             except Exception as exc:
                 logger.warning("Partial profit sell failed for %s: %s", symbol, exc)
             return  # skip normal signal logic this cycle
 
+    # Partial remainder exit: check if remaining shares after partial profit should be sold
+    if position_qty > 0 and risk.has_partial_profit_taken(symbol):
+        risk.increment_partial_profit_bars(symbol)
+        risk.update_partial_profit_peak(symbol, signal.close)
+        should_exit, exit_reason = risk.should_exit_partial_remainder(symbol, signal.close)
+        if should_exit:
+            logger.info("Partial remainder exit for %s: %s", symbol, exit_reason)
+            try:
+                broker.submit_order(
+                    symbol, "SELL", position_qty,
+                    order_type="market",
+                    max_retries=settings.max_api_retries,
+                )
+                risk.clear_partial_profit(symbol)
+                risk.clear_trailing_peak(symbol)
+                journal.write("partial_remainder_exit", {
+                    "symbol": symbol, "qty": position_qty, "reason": exit_reason,
+                })
+                notifier.notify("trade", f"Partial remainder SELL {position_qty} {symbol}: {exit_reason}")
+            except Exception as exc:
+                logger.warning("Partial remainder exit failed for %s: %s", symbol, exc)
+            return
+
     # Trailing stop check — force SELL if trailing stop breached
-    # Skipped for symbols where partial profit was taken (remaining shares are lifetime holds)
+    # Skipped for symbols where partial profit was taken (they have their own exit rules above)
     if position_qty > 0 and settings.trailing_stop_pct > 0 and not risk.has_partial_profit_taken(symbol):
         risk.update_trailing_peak(symbol, signal.close)
         if risk.should_trail_stop(symbol, signal.close):
@@ -247,9 +279,9 @@ def _trade_symbol(
         # Kelly sizing
         if settings.use_kelly_sizing:
             requested_qty = risk.kelly_qty(
-                win_rate=0.52,   # Conservative default; replace with historical win rate
-                avg_win=0.015,
-                avg_loss=0.01,
+                win_rate=settings.kelly_win_rate,
+                avg_win=settings.kelly_avg_win,
+                avg_loss=settings.kelly_avg_loss,
                 equity=float(account["equity"]),
                 price=signal.close,
             )
@@ -381,6 +413,60 @@ def _trade_symbol(
                 logger.warning("Failed to place stop-loss for %s: %s", symbol, sl_exc)
 
 
+def _ensemble_signal(bars, symbol: str, settings, journal, logger):
+    """Generate signal using the ensemble strategy with error isolation."""
+    from ai_trading.strategy.ensemble import compute_ensemble_signal
+    from ai_trading.strategy.moving_average import SignalResult
+
+    # Get ML probability if available
+    ml_probability = None
+    try:
+        from ai_trading.ml.predict_direction import predict_probability
+        ml_probability = predict_probability(symbol, settings.ml_model_path)
+    except Exception as exc:
+        logger.debug("ML probability unavailable for %s: %s", symbol, exc)
+
+    try:
+        ensemble = compute_ensemble_signal(bars, ml_probability=ml_probability)
+        journal.write("ensemble_signal", {
+            "symbol": symbol,
+            "signal": ensemble.signal,
+            "strength": ensemble.strength,
+            "confidence": ensemble.confidence,
+            "regime": ensemble.regime.value,
+            "consensus_count": ensemble.consensus_count,
+            "weights": ensemble.weights_used,
+        })
+        close = float(bars["close"].iloc[-1])
+        # Return as SignalResult for compatibility with rest of bot logic
+        return SignalResult(ensemble.signal, close, 0.0, 0.0)
+    except Exception as exc:
+        logger.warning("Ensemble strategy failed for %s, falling back to MA: %s", symbol, exc)
+        from ai_trading.strategy.moving_average import moving_average_signal
+        return moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
+
+
+def _check_ml_model_staleness(settings, notifier, logger):
+    """Alert if the ML model file is older than the configured threshold."""
+    model_path = Path(settings.ml_model_path)
+    if not model_path.exists():
+        logger.info("ML model not found at %s — staleness check skipped", model_path)
+        return
+    try:
+        import time as _time
+        age_days = (_time.time() - model_path.stat().st_mtime) / 86400.0
+        if age_days > settings.ml_model_max_age_days:
+            msg = (
+                f"⚠️ ML model is stale: {age_days:.1f} days old "
+                f"(threshold: {settings.ml_model_max_age_days} days). "
+                f"Consider retraining."
+            )
+            logger.warning(msg)
+            notifier.notify("error", msg)
+    except Exception as exc:
+        logger.debug("ML staleness check failed: %s", exc)
+
+
 def _apply_sentiment(signal_value: str, symbol: str, settings: Settings, journal: Journal, logger) -> str:
     """Apply sentiment filter and return effective signal."""
     if not settings.use_sentiment_filter or signal_value == "HOLD":
@@ -423,6 +509,10 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
     journal = Journal(settings.journal_path)
     notifier = Notifier(settings.webhook_url, settings.notify_events)
 
+    # Configure sentiment cache TTL
+    if settings.sentiment_cache_ttl_sec > 0:
+        configure_sentiment_cache(settings.sentiment_cache_ttl_sec)
+
     if settings.is_live:
         logger.warning(LIVE_WARNING)
         journal.write("mode", {"mode": "LIVE", "warning": LIVE_WARNING})
@@ -430,7 +520,10 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         logger.info(PAPER_NOTICE)
 
     broker = AlpacaBroker(settings.api_key, settings.api_secret, paper=settings.paper_only)
-    market_data = AlpacaMarketData(settings.api_key, settings.api_secret)
+    market_data = AlpacaMarketData(
+        settings.api_key, settings.api_secret,
+        cache_ttl_sec=settings.data_cache_ttl_sec,
+    )
 
     risk = RiskManager(
         paper_only=settings.paper_only,
@@ -446,7 +539,14 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         use_kelly_sizing=settings.use_kelly_sizing,
         kelly_fraction=settings.kelly_fraction,
         kelly_max_shares=settings.kelly_max_shares,
+        kelly_win_rate=settings.kelly_win_rate,
+        kelly_avg_win=settings.kelly_avg_win,
+        kelly_avg_loss=settings.kelly_avg_loss,
         trailing_stop_pct=settings.trailing_stop_pct,
+        error_streak_decay_hours=settings.error_streak_decay_hours,
+        partial_profit_max_hold_bars=settings.partial_profit_max_hold_bars,
+        partial_profit_trailing_stop_pct=settings.partial_profit_trailing_stop_pct,
+        state_file=settings.risk_state_file,
     )
 
     now = datetime.now(timezone.utc)
@@ -466,6 +566,13 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
 
         account = broker.account_state()
         journal.write("account_state", account)
+
+        # Record start-of-day equity for accurate daily loss tracking
+        risk.set_start_of_day_equity(float(account["equity"]))
+
+        # ML model staleness alert
+        if settings.ml_model_max_age_days > 0:
+            _check_ml_model_staleness(settings, notifier, logger)
 
         cfg_symbols = settings.get_symbols()
         # If no explicit symbol list configured, pull the full tradable universe

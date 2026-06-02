@@ -108,14 +108,21 @@ class SentimentAnalyzer:
         """
         return [self.score_headline(article) for article in articles]
 
-    def aggregate_sentiment(self, articles: Sequence[NewsArticle]) -> AggregateSentiment:
+    def aggregate_sentiment(
+        self,
+        articles: Sequence[NewsArticle],
+        time_decay_hours: float = 48.0,
+    ) -> AggregateSentiment:
         """Compute weighted aggregate sentiment from multiple articles.
 
         The aggregate score is a weighted average of individual compound scores,
-        where weights are determined by article category and relevance.
+        where weights are determined by article category, relevance, and recency.
+        Recent articles receive higher weight via exponential time decay.
 
         Args:
             articles: List of NewsArticle instances.
+            time_decay_hours: Half-life for time decay in hours. Articles older
+                than this get exponentially less weight. Set to 0 to disable.
 
         Returns:
             AggregateSentiment with overall score and breakdown.
@@ -134,12 +141,26 @@ class SentimentAnalyzer:
 
         scores = self.score_articles(articles)
 
+        # Apply time-decay weighting: recent articles matter more
+        now = datetime.now(timezone.utc)
+        effective_weights = []
+        for i, s in enumerate(scores):
+            base_weight = s.weight
+            if time_decay_hours > 0 and i < len(articles):
+                article_age_hours = (now - articles[i].timestamp).total_seconds() / 3600.0
+                # Exponential decay: weight halves every time_decay_hours
+                decay_factor = 0.5 ** (article_age_hours / time_decay_hours)
+                base_weight *= decay_factor
+            effective_weights.append(base_weight)
+
         # Weighted average
-        total_weight = sum(s.weight for s in scores)
+        total_weight = sum(effective_weights)
         if total_weight == 0:
             total_weight = 1.0
 
-        weighted_score = sum(s.compound * s.weight for s in scores) / total_weight
+        weighted_score = sum(
+            s.compound * w for s, w in zip(scores, effective_weights)
+        ) / total_weight
 
         # Counts
         num_positive = sum(1 for s in scores if s.compound >= 0.05)
