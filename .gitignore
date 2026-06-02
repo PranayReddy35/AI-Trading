@@ -5,3 +5,7 @@ logs/
 *.egg-info/
 .env
 .streamlit/secrets.toml
+
+# Local caches and trained model artifacts
+.cache/
+models/

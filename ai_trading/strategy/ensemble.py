@@ -53,6 +53,11 @@ class RegimeState:
     details: dict
 
 
+# Re-export StrategySignal from the shared types module.
+# Kept here for backwards compatibility with `from ai_trading.strategy.ensemble import StrategySignal`.
+from ai_trading.strategy.types import StrategySignal  # noqa: E402,F401
+
+
 def detect_regime(bars: pd.DataFrame, lookback: int = 60) -> RegimeState:
     """Detect current market regime from price data.
 
@@ -187,14 +192,7 @@ def detect_regime(bars: pd.DataFrame, lookback: int = 60) -> RegimeState:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class StrategySignal:
-    """Signal from an individual strategy."""
-
-    name: str
-    signal: float  # -1.0 (strong sell) to +1.0 (strong buy), 0 = neutral
-    confidence: float  # 0-1 confidence in signal
-    reason: str
+# NOTE: StrategySignal is defined in ai_trading.strategy.types and re-exported above.
 
 
 def trend_following_signal(bars: pd.DataFrame, fast: int = 10, slow: int = 30) -> StrategySignal:
@@ -334,13 +332,15 @@ def momentum_signal(bars: pd.DataFrame) -> StrategySignal:
 # ---------------------------------------------------------------------------
 
 
-# Regime-based strategy weights: which strategies work best in which regime
+# Regime-based strategy weights: which strategies work best in which regime.
+# `patterns` aggregates Fibonacci retracement, S/R breakouts, double tops/bottoms,
+# candlestick patterns, MACD crossover, and pivot points (see strategy/patterns.py).
 REGIME_WEIGHTS: dict[MarketRegime, dict[str, float]] = {
-    MarketRegime.BULL_TREND: {"trend": 0.45, "momentum": 0.35, "mean_reversion": 0.10, "ml": 0.10},
-    MarketRegime.BEAR_TREND: {"trend": 0.40, "momentum": 0.20, "mean_reversion": 0.20, "ml": 0.20},
-    MarketRegime.SIDEWAYS: {"trend": 0.10, "momentum": 0.15, "mean_reversion": 0.45, "ml": 0.30},
-    MarketRegime.HIGH_VOLATILITY: {"trend": 0.20, "momentum": 0.20, "mean_reversion": 0.30, "ml": 0.30},
-    MarketRegime.LOW_VOLATILITY: {"trend": 0.30, "momentum": 0.30, "mean_reversion": 0.15, "ml": 0.25},
+    MarketRegime.BULL_TREND:     {"trend": 0.35, "momentum": 0.30, "mean_reversion": 0.05, "patterns": 0.15, "ml": 0.15},
+    MarketRegime.BEAR_TREND:     {"trend": 0.30, "momentum": 0.15, "mean_reversion": 0.15, "patterns": 0.20, "ml": 0.20},
+    MarketRegime.SIDEWAYS:       {"trend": 0.05, "momentum": 0.10, "mean_reversion": 0.35, "patterns": 0.25, "ml": 0.25},
+    MarketRegime.HIGH_VOLATILITY:{"trend": 0.15, "momentum": 0.15, "mean_reversion": 0.25, "patterns": 0.20, "ml": 0.25},
+    MarketRegime.LOW_VOLATILITY: {"trend": 0.25, "momentum": 0.25, "mean_reversion": 0.10, "patterns": 0.20, "ml": 0.20},
 }
 
 
@@ -380,12 +380,15 @@ def compute_ensemble_signal(
     regime_state = detect_regime(bars)
     regime = regime_state.regime
 
-    # Get individual strategy signals with error isolation
-    signals: list[StrategySignal] = []
-    _strategy_funcs = [
-        ("trend", trend_following_signal),
-        ("mean_reversion", mean_reversion_signal),
-        ("momentum", momentum_signal),
+    # Get individual strategy signals
+    # Imported here to avoid a circular import (patterns imports StrategySignal from this module).
+    from ai_trading.strategy.patterns import pattern_signal
+
+    signals: list[StrategySignal] = [
+        trend_following_signal(bars),
+        mean_reversion_signal(bars),
+        momentum_signal(bars),
+        pattern_signal(bars),
     ]
     for name, func in _strategy_funcs:
         try:

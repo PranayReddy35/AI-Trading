@@ -9,27 +9,36 @@
 Production-ready module structure:
 
 - `ai_trading/config.py` – runtime settings from environment variables (paper + live)
-- `ai_trading/data/` – market data access (Alpaca)
-- `ai_trading/strategy/` – signal generation (MA, ensemble, regime-adaptive)
+- `ai_trading/data/` – market data access (Alpaca, yfinance) + symbol universe loader
+- `ai_trading/data/universe.py` – **S&P 500 / Nasdaq 100 / Dow 30** ticker loader (Wikipedia, cached weekly)
+- `ai_trading/strategy/` – signal generation (MA, ensemble, regime-adaptive, patterns)
 - `ai_trading/strategy/ensemble.py` – **multi-strategy ensemble** with regime detection
+- `ai_trading/strategy/market_filters.py` – **macro gates**: SPY 200DMA, VIX scaling, earnings blackout, volume confirm, spread filter
 - `ai_trading/risk/` – comprehensive risk checks and safety guards
+- `ai_trading/risk/portfolio_sizing.py` – **vol-targeted sizing**, portfolio heat cap, fractional Kelly
+- `ai_trading/risk/exits.py` – **trailing ATR stop**, partial take-profit, time stop, break-even stop
 - `ai_trading/broker/` – Alpaca broker wrapper (market + limit orders, stop-loss, retry logic, order tracking)
 - `ai_trading/storage/` – logging + JSONL journaling
 - `ai_trading/notifications/` – webhook alerts (Slack, Discord, or generic)
 - `ai_trading/bot.py` – trading bot (single run, paper or live)
 - `ai_trading/runner.py` – daily scheduling runner with graceful shutdown
+- `ai_trading/scanner.py` – **live market scanner** (EOD + intraday) with RS, BB squeeze, meta-label, ATR levels, correlation dedup
+- `ai_trading/dashboard.py` – Streamlit dashboard (positions, P&L, live scanner, sell scanner, **Position Advisor with sizing**, regime heatmap, Options Lab)
 - `ai_trading/backtest.py` – basic backtest (rule-based MA logic)
-- `ai_trading/backtest_realistic.py` – **realistic backtest** with slippage, commissions, Kelly sizing, Monte Carlo risk analysis
+- `ai_trading/backtest_realistic.py` – realistic backtest with slippage, commissions, Kelly sizing, Monte Carlo
+- `ai_trading/backtest/ensemble_cost_aware.py` – **cost-aware ensemble backtest** (commission + slippage + spread)
+- `ai_trading/backtest/regime_optimizer.py` – **walk-forward optimizer** for per-symbol regime weights
 - `ai_trading/ml/predict_direction.py` – basic ML (logistic regression) next-day direction script
-- `ai_trading/ml/ensemble_model.py` – **advanced ensemble ML** (GradientBoosting + RandomForest) with 35+ features and walk-forward validation
+- `ai_trading/ml/ensemble_model.py` – advanced ensemble ML (GradientBoosting + RandomForest) with 35+ features
+- `ai_trading/ml/meta_label.py` – **meta-labeling**: predicts P(hit +1R before −1R) via triple-barrier labels
 - `ai_trading/data/news_sentiment.py` – news fetcher (Google News RSS free, Alpha Vantage free tier)
-- `ai_trading/data/social_sentiment.py` – social media fetcher (Reddit public API, free, no key)
+- `ai_trading/data/social_sentiment.py` – social media fetcher (Reddit public API, free)
 - `ai_trading/ml/sentiment.py` – VADER-based sentiment scoring and feature engineering
 - `ai_trading/strategy/sentiment_filter.py` – sentiment overlay that can block trades on extreme news
 
 ## Safety and risk controls
 
-`RiskManager` includes:
+`RiskManager` and the trade pipeline include:
 
 - **Paper-trading-only safety guard** (blocks live orders unless explicitly enabled)
 - **Market-closed guard**
@@ -45,6 +54,12 @@ Production-ready module structure:
 - **Trade cooldown** (prevents rapid re-entry after a trade)
 - **Order confirmation** (interactive prompt for live orders)
 - **Pre-flight checks** (account status validation before every run)
+- **Macro filters** — SPY 200DMA gate, VIX size scaling, earnings blackout, volume confirmation, spread filter
+- **Vol-targeted sizing** — caps each position to a fixed % of equity in daily volatility
+- **Portfolio heat cap** — total open dollar-risk across all positions stays under % of equity
+- **Trailing ATR stop / partial TP / time stop / break-even shift**
+- **Meta-label gate** — skips BUYs the ML model thinks won't reach +1R before −1R
+- **Correlation dedup** (scanner) — surfaces only diversified picks
 
 ## Setup
 
@@ -172,8 +187,80 @@ export BOT_SOCIAL_TIME_FILTER="week"
 ```
 
 > **Note on other social platforms:**
+>
 > - **Twitter/X**: The free API tier does NOT support reading tweets (only posting). Not viable at zero cost.
 > - **Discord**: Requires bot membership in specific servers. No public API for sentiment data.
+
+### Macro / quality filters
+
+```bash
+# SPY 200-day moving average gate — block new longs in risk-off regimes
+export BOT_USE_SPY_TREND_FILTER="true"
+export BOT_SPY_TREND_WINDOW="200"
+
+# VIX-based size scaling — full size below 20, half above 25, zero above 35
+export BOT_USE_VIX_SIZE_SCALING="true"
+export BOT_VIX_FULL_BELOW="20"
+export BOT_VIX_HALF_ABOVE="25"
+export BOT_VIX_ZERO_ABOVE="35"
+
+# Earnings blackout — skip new positions N days before earnings (0 = disabled)
+export BOT_EARNINGS_BLACKOUT_DAYS="2"
+
+# Volume confirmation — reject signals when bar volume < ratio × 20d avg
+export BOT_USE_VOLUME_CONFIRMATION="true"
+export BOT_VOLUME_MIN_RATIO="0.8"
+
+# Spread filter — reject quotes wider than N basis points
+export BOT_USE_SPREAD_FILTER="true"
+export BOT_MAX_SPREAD_BPS="10"
+```
+
+### Position sizing (vol targeting + portfolio heat)
+
+```bash
+# Vol-targeted sizing — target % of equity per trade in daily volatility
+export BOT_USE_VOL_TARGETING="true"
+export BOT_TARGET_VOL_PCT="1.0"
+export BOT_MAX_POSITION_PCT="20.0"
+
+# Portfolio heat cap — total open dollar-risk as % of equity
+export BOT_MAX_PORTFOLIO_HEAT_PCT="6.0"
+```
+
+### Trailing exits
+
+```bash
+# Trailing ATR stop — ratchets stop up to (peak − k × ATR) for longs
+export BOT_USE_TRAILING_ATR_STOP="true"
+export BOT_TRAILING_ATR_MULT="2.5"
+
+# Time stop — exit if trade hasn't made min_progress R within max_bars (0 = disabled)
+export BOT_TIME_STOP_MAX_BARS="0"
+export BOT_TIME_STOP_MIN_R="0.5"
+
+# Partial take-profit and break-even shift triggers (in R multiples)
+export BOT_PARTIAL_TAKE_R="1.0"
+export BOT_BREAKEVEN_R="1.0"
+```
+
+### Meta-labeling ML
+
+```bash
+# Enable meta-label: reject BUYs with P(hit +1R before -1R) below threshold
+export BOT_USE_META_LABEL="true"
+export BOT_META_MODEL_PATH="models/meta_label.joblib"
+export BOT_META_MIN_PROB="0.55"
+# If true, scale position size by meta probability instead of just gating
+export BOT_META_SIZE_SCALE="false"
+```
+
+Train the meta-label model before enabling it:
+
+```bash
+python -c "from ai_trading.ml.meta_label import train_and_save; \
+  train_and_save('SPY', out_path='models/meta_label.joblib', period='3y')"
+```
 
 ## Run the bot
 
@@ -202,6 +289,7 @@ python -m ai_trading.bot --symbol QQQ
 ## Scheduling (daily execution)
 
 Use OS scheduler (cron/systemd/task scheduler) in production. The built-in runner provides:
+
 - Graceful shutdown (SIGINT/SIGTERM)
 - Health check mode
 - Configurable run time
@@ -266,6 +354,7 @@ python -m ai_trading.backtest_realistic --symbol SPY --strategy ensemble --no-ke
 ### Live trading readiness checklist (automated)
 
 The realistic backtest automatically evaluates 8 criteria:
+
 - ✓ Sharpe ratio > 1.5
 - ✓ Profit factor > 1.5
 - ✓ Beats buy-and-hold benchmark
@@ -274,6 +363,237 @@ The realistic backtest automatically evaluates 8 criteria:
 - ✓ Ruin probability < 5%
 - ✓ Kelly fraction > 0
 - ✓ Positive expectancy per trade
+
+## Cost-aware ensemble backtest
+
+Models real transaction costs (per-share commission, slippage in bps, half-spread) and reports
+trades, win-rate, profit factor, expectancy, Sharpe, max-drawdown, and total costs.
+
+```bash
+python -m ai_trading.backtest.ensemble_cost_aware SPY,QQQ,AAPL,MSFT,NVDA \
+    --period 2y --commission 0.005 --slip-bps 5 --spread-bps 2 \
+    --out logs/cost_aware_2y.json
+```
+
+## Walk-forward regime-weight optimizer
+
+Rolling train/test windows pick the best per-symbol weights for each strategy component
+(trend, momentum, mean-reversion, patterns, ML) within each detected regime. Output is
+consumed by `ai_trading/strategy/ensemble.py` at signal time.
+
+```bash
+python -m ai_trading.backtest.regime_optimizer SPY,QQQ,AAPL,MSFT,NVDA \
+    --period 2y --train 180 --test 60 --out logs/regime_weights.json
+```
+
+## Live market scanner
+
+Ranks symbols by composite buy-opportunity score using free data (yfinance EOD,
+Alpaca IEX 5-min intraday). Includes liquidity gate, relative strength vs SPY,
+Bollinger-band squeeze, meta-label P(win), ATR-based entry/stop/target levels,
+macro quality gates, and correlation-based dedup.
+
+```bash
+# Scan all major indexes (S&P 500 + Nasdaq 100 + Dow 30 = ~516 unique tickers)
+python -m ai_trading.scanner --universe all --top 10 --only-pass
+
+# Specific indexes
+python -m ai_trading.scanner --universe sp500,dow30 --top 20
+
+# Mix index universe with custom tickers
+python -m ai_trading.scanner --universe nasdaq100 --symbols COIN,RIVN --top 15
+
+# Force live (Alpaca intraday) mode during market hours
+python -m ai_trading.scanner --mode live --universe all --top 10
+
+# Refresh the cached index lists from Wikipedia (cache TTL: 7 days)
+python -m ai_trading.scanner --universe all --refresh-universe --top 10
+```
+
+Available flags:
+
+| Flag                  | Default           | Purpose                              |
+| --------------------- | ----------------- | ------------------------------------ |
+| `--symbols`           | env `BOT_SYMBOLS` | Comma-separated tickers              |
+| `--universe`          | (none)            | `sp500`, `nasdaq100`, `dow30`, `all` |
+| `--refresh-universe`  | false             | Force re-fetch index lists           |
+| `--mode`              | `auto`            | `auto` / `live` / `eod`              |
+| `--top`               | 10                | Top N results                        |
+| `--min-price`         | 5.0               | Liquidity gate: min last close       |
+| `--min-dollar-vol`    | 5,000,000         | Liquidity gate: 20d avg $-volume     |
+| `--no-filters`        | false             | Skip macro quality gates             |
+| `--earnings-blackout` | 2                 | Days before earnings to flag (0=off) |
+| `--no-meta`           | false             | Skip meta-label inference            |
+| `--no-dedup`          | false             | Skip correlation dedup               |
+| `--max-corr`          | 0.85              | Dedup threshold                      |
+| `--only-pass`         | false             | Hide picks that fail quality gates   |
+
+Scanner output columns: `Score` · `Sig` · `Price` · `1D%` · `5D%` (or `Intra%`) · `RSI` ·
+`VolX` · `MA%` (or `VWAP%`) · `RS%` (vs SPY) · `Sqz` (BB squeeze 0–1) · `Meta` (P(win) 0–1) ·
+`Entry`/`Stop`/`Tgt` (ATR-based, 2:1 R:R) · `R%` (risk per trade) · `Gate` (`PASS` or rejection
+reasons) · `Reason` (ranked drivers).
+
+## Symbol universe loader
+
+Standalone CLI for fetching / refreshing the cached index ticker lists.
+
+```bash
+# Print every ticker in all major indexes (de-duplicated)
+python -m ai_trading.data.universe all
+
+# Count members of a single index
+python -m ai_trading.data.universe --count-only sp500
+
+# Force refresh from Wikipedia
+python -m ai_trading.data.universe --refresh all
+```
+
+Cached under `logs/universe/{sp500,nasdaq100,dow30}.json` (TTL 7 days). Falls back
+to a built-in static list if Wikipedia is unreachable. Tickers are normalized for
+yfinance (`BRK.B` → `BRK-B`).
+
+## Options trading
+
+The bot includes a full options stack under `ai_trading/options/`:
+
+| File             | Purpose                                                                   |
+| ---------------- | ------------------------------------------------------------------------- |
+| `chains.py`      | Fetch + normalize option chains (Alpaca primary, yfinance fallback)       |
+| `greeks.py`      | Black-Scholes pricing, greeks (Δ/Γ/Θ/V/ρ), IV solver, POP helper          |
+| `strategies.py`  | Build candidates for 10 strategies with max profit / max loss / POP / R:R |
+| `scanner.py`     | Top-level scanner; can pre-filter underlyings via the equity scanner      |
+| `broker.py`      | Single-leg + multi-leg (MLEG) option orders via alpaca-py                 |
+| `integration.py` | Hook called from `bot.run_once` when `BOT_OPTIONS_ENABLED=true`           |
+| `runner.py`      | CLI: `scan`, `trade`, `positions`, `close`                                |
+
+### Supported strategies
+
+| Strategy                 | Bias                       | Legs       | Risk                            |
+| ------------------------ | -------------------------- | ---------- | ------------------------------- |
+| `long_call`              | bullish                    | 1          | defined (premium)               |
+| `long_put`               | bearish                    | 1          | defined (premium)               |
+| `csp` (cash-secured put) | neutral / bullish          | 1          | defined (strike × 100 − credit) |
+| `covered_call`           | neutral / slightly bullish | 1 (+stock) | defined (cost basis)            |
+| `bull_call` / `bear_put` | directional                | 2          | defined (debit)                 |
+| `bull_put` / `bear_call` | directional credit         | 2          | defined (width − credit)        |
+| `iron_condor`            | neutral / range-bound      | 4          | defined (wing width − credit)   |
+| `short_strangle`         | neutral / high IV          | 2          | **undefined** (naked)           |
+
+### CLI
+
+```bash
+# Scan only — top candidates for a few underlyings, all strategies:
+python -m ai_trading.options.scanner \
+    --underlying SPY --underlying AAPL --underlying NVDA \
+    --strategies long_call,csp,bull_call,iron_condor \
+    --min-dte 21 --max-dte 45 --delta 0.30 --top 15
+
+# Scan with equity-scanner pre-filter (picks bullish names from a universe):
+python -m ai_trading.options.scanner --universe sp500 \
+    --strategies bull_call,csp --top 20
+
+# Trade: scan + place top N paper orders with gates (POP, max risk):
+python -m ai_trading.options.runner trade \
+    --universe dow30 --strategies bull_call,csp \
+    --top 3 --qty 1 --min-pop 0.65 --max-risk-pct 1.0 \
+    --confirm --paper
+
+# List + close:
+python -m ai_trading.options.runner positions --paper
+python -m ai_trading.options.runner close SPY250620C00500000 --paper
+```
+
+### Bot integration (env vars)
+
+Setting `BOT_OPTIONS_ENABLED=true` makes the regular bot loop also run an
+options cycle each invocation against the configured `BOT_SYMBOLS`:
+
+```ini
+BOT_OPTIONS_ENABLED=true
+BOT_OPTIONS_STRATEGIES=long_call,csp,bull_call
+BOT_OPTIONS_QTY=1
+BOT_OPTIONS_MIN_POP=0.60             # only place trades with ≥60% POP
+BOT_OPTIONS_MAX_RISK_PCT=1.0         # max risk per trade as % of options BP
+BOT_OPTIONS_MIN_DTE=21
+BOT_OPTIONS_MAX_DTE=45
+BOT_OPTIONS_TARGET_DELTA=0.30        # |Δ| target for long/short legs
+BOT_OPTIONS_SPREAD_WIDTH=5.0
+BOT_OPTIONS_DATA_SOURCE=auto         # auto | alpaca | yfinance
+BOT_OPTIONS_TOP_N=5
+BOT_OPTIONS_SLIPPAGE_PCT=0
+BOT_OPTIONS_ALLOW_NAKED=false        # block undefined-risk strategies
+BOT_OPTIONS_DRY_RUN=true             # SAFE DEFAULT: log candidates, don't submit
+```
+
+To start placing real paper orders, flip `BOT_OPTIONS_DRY_RUN=false`. Live
+orders also require `BOT_PAPER_ONLY=false` (the broker handles paper/live mode).
+
+### Dashboard
+
+The Streamlit dashboard has a new **🎯 Options Lab** page that lets you
+configure underlyings + strategies, run a scan interactively, inspect any
+candidate's full leg breakdown, and submit it as a paper order with one click.
+It also shows open option positions.
+
+### Position Advisor (Buy / Hold / Trim / Sell, with sizing)
+
+The dashboard's **🧮 Position Advisor** page tells you what to do with a
+position you already own. It combines your **P&L** with **live market signals**
+(RSI, trend, momentum, volume, MA/VWAP gap) and returns a recommended action
+plus a **concrete share count and dollar amount** to transact.
+
+Two input modes:
+
+- **✍️ Single Position** — type symbol, shares, average cost, optional market value.
+- **📥 Upload Portfolio CSV (Robinhood / etc.)** — upload a positions export or
+  **paste CSV / tab-separated text** straight from your broker, Google Sheets, or
+  Excel. The parser handles ragged rows, currency values with embedded commas
+  (`$1,067.00`, `$1,234,567.00`), parenthesised negatives, and column-name
+  variants (`Symbol`/`Ticker`, `Shares`/`Quantity`, `Average cost`/`Cost basis`,
+  `Market value`/`Equity`/`Current value`). Skipped rows (cash, pending activity,
+  totals) are reported with the reason so nothing silently disappears.
+
+Two **holding horizons**:
+
+- **⚡ Short-term (swing/day-trade)** — aggressive trimming on RSI≥70 / gap≥6% /
+  momentum spikes. TAKE PROFIT closes the full position.
+- **📈 Long-term investor (let winners run)** — ignores minor overbought signals
+  when the multi-week trend is strong (≥55% consistency). Only true blowoffs
+  (RSI≥80, gap≥12%, or 5-day momentum≥20%) trigger TAKE PROFIT, and even then it
+  leaves a 25% runner. A single weak short-term signal won't shake you out of a
+  multi-month winner.
+
+Sizing rules (varies by horizon and how stretched / strong the setup is):
+
+| Action                       | Sizing                                                                                                               |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| TAKE PROFIT                  | Sell 100% (short-term) / 75% with runner (long-term)                                                                 |
+| TRIM                         | Sell 25% / 33% / 50% based on RSI + gap + momentum stretch                                                           |
+| SELL (weak setup, in profit) | Sell all shares                                                                                                      |
+| BUY MORE                     | Add 25% / 33% / 50% of position value (scales with bot score; up to 60% in long-term mode on high-conviction setups) |
+| HOLD                         | No action — hold current size                                                                                        |
+
+### Sell Scanner (full-market mode + long-term toggle)
+
+The **💸 Sell Scanner** page now supports:
+
+- **🌐 Scan ENTIRE market (~12K tickers)** — not just the curated S&P / Nasdaq /
+  Dow universe. Use pre-filters to keep the scan tractable.
+- **📈 Long-term investor** horizon — same logic as Position Advisor: dampens
+  trim/sell signals on stocks with strong multi-week trends, only flags true
+  blowoffs.
+- **Search box, action multiselect, and pagination** (25/page) so you can find a
+  specific ticker or filter to just TAKE PROFIT / TRIM rows.
+
+### Journal events
+
+Options activity appears in `logs/journal.jsonl` as:
+
+- `option_open` — order submitted (includes full `candidate` dict with legs)
+- `option_close` — manual close issued
+- `option_order_error` — submit failed
+- `option_dry_run` — would have submitted but `BOT_OPTIONS_DRY_RUN=true`
+- `option_cycle_error` — fatal error in the options cycle
 
 ## Advanced ML model (ensemble)
 
@@ -296,14 +616,15 @@ python -m ai_trading.ml.ensemble_model --symbol SPY --save-model ensemble_model.
 
 The ensemble strategy combines 4 uncorrelated signal generators:
 
-| Strategy | Best in regime | Description |
-|----------|---------------|-------------|
+| Strategy        | Best in regime   | Description                                    |
+| --------------- | ---------------- | ---------------------------------------------- |
 | Trend following | Bull/Bear trends | Adaptive EMA crossover with slope confirmation |
-| Mean reversion | Sideways markets | Bollinger Bands + RSI oversold/overbought |
-| Momentum | Breakouts | Rate of change + volume surge detection |
-| ML model | All regimes | Ensemble probability as directional signal |
+| Mean reversion  | Sideways markets | Bollinger Bands + RSI oversold/overbought      |
+| Momentum        | Breakouts        | Rate of change + volume surge detection        |
+| ML model        | All regimes      | Ensemble probability as directional signal     |
 
 Strategies are weighted by detected **market regime**:
+
 - **Bull trend**: Trend (45%) + Momentum (35%) + Mean reversion (10%) + ML (10%)
 - **Bear trend**: Trend (40%) + Momentum (20%) + Mean reversion (20%) + ML (20%)
 - **Sideways**: Mean reversion (45%) + ML (30%) + Momentum (15%) + Trend (10%)
@@ -354,9 +675,27 @@ python -m ai_trading.ml.predict_direction --symbol SPY --save-model model.joblib
 ## Logs and artifacts
 
 - Bot log: `logs/bot.log`
+- Dashboard log: `logs/dashboard.log`
 - Trade journal (JSONL): `logs/journal.jsonl`
+- Symbol-universe cache: `logs/universe/{sp500,nasdaq100,dow30}.json`
+- Cost-aware backtest report: `logs/cost_aware_*.json`
+- Regime-weight optimizer output: `logs/regime_weights.json`
+- Trained meta-label model: `models/meta_label.joblib`
 
-Journal events include: `account_state`, `signal`, `decision`, `order`, `fill_status`, `stop_loss`, `risk_reject`, `error`, `preflight_failed`, `user_cancel`
+Journal events include: `account_state`, `signal`, `decision`, `order`, `fill_status`,
+`stop_loss`, `risk_reject`, `error`, `preflight_failed`, `user_cancel`,
+`spy_trend_reject`, `vix_reject`, `earnings_blackout_reject`, `volume_reject`,
+`meta_label_reject`, `heat_reject`, `correlation_reject`, `trailing_stop_update`,
+`partial_take`, `time_stop`, `breakeven_shift`
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+83 tests covering: indicators, patterns, risk manager, position sizing & exits,
+market filters, meta-label, scanner enhancements, universe loader.
 
 ## Production checklist
 

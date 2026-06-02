@@ -6,10 +6,17 @@ from datetime import datetime, timezone
 from ai_trading.broker.alpaca_broker import AlpacaBroker, OrderError
 from ai_trading.config import Settings
 from ai_trading.data.market_data import AlpacaMarketData
+from ai_trading.data.cache import BarCache
 from ai_trading.notifications.alerter import Notifier
 from ai_trading.risk.manager import RiskManager
 from ai_trading.risk.correlation import is_too_correlated
+from ai_trading.risk.correlation_scaling import correlation_scale
+from ai_trading.risk.sizing import (
+    adaptive_thresholds,
+    compute_atr_stop_and_size,
+)
 from ai_trading.storage.journal import Journal, configure_logging
+from ai_trading.storage.json_logger import log_ensemble_decision
 from ai_trading.strategy.moving_average import moving_average_signal, dip_buy_signal
 from ai_trading.strategy.sentiment_filter import apply_sentiment_filter, configure_sentiment_cache
 
@@ -91,15 +98,50 @@ def _trade_symbol(
     market_is_open: bool = True,
 ) -> None:
     """Run one full trade cycle for a single symbol."""
-    bars = market_data.get_bars(symbol, settings.lookback_days, settings.bar_timeframe)
+    # Optional cache: skip re-downloading the same bars within TTL
+    if settings.cache_enabled:
+        cache = BarCache(settings.cache_dir, ttl_seconds=settings.cache_ttl_sec)
+        bars = cache.get_or_fetch(
+            symbol, settings.lookback_days, settings.bar_timeframe,
+            fetch=market_data.get_bars,
+        )
+    else:
+        bars = market_data.get_bars(symbol, settings.lookback_days, settings.bar_timeframe)
     all_bars[symbol] = bars
 
-    # Generate signal based on strategy_mode
-    if settings.strategy_mode == "ensemble":
-        signal = _ensemble_signal(bars, symbol, settings, journal, logger)
+    # Choose signal source: ensemble (with optional MTF confirmation) or legacy MA crossover.
+    if settings.use_ensemble_signal:
+        from ai_trading.strategy.ensemble import compute_ensemble_signal
+        from ai_trading.strategy.moving_average import SignalResult
+        if settings.use_adaptive_thresholds:
+            buy_th, sell_th = adaptive_thresholds(
+                bars, settings.base_buy_threshold, settings.base_sell_threshold
+            )
+        else:
+            buy_th, sell_th = settings.base_buy_threshold, settings.base_sell_threshold
+        es = compute_ensemble_signal(bars, buy_threshold=buy_th, sell_threshold=sell_th)
+
+        # Multi-timeframe confirmation: require the higher timeframe(s) to agree in direction.
+        if settings.use_mtf_confirmation and es.signal in ("BUY", "SELL"):
+            from ai_trading.strategy.multi_timeframe import mtf_signal
+            tfs = [t.strip() for t in settings.mtf_timeframes.split(",") if t.strip()]
+            mtf = mtf_signal(symbol, market_data.get_bars, timeframes=tfs,
+                             lookback_days=settings.lookback_days)
+            if (es.signal == "BUY" and mtf.signal < 0) or (es.signal == "SELL" and mtf.signal > 0):
+                logger.info("MTF disagrees on %s (%s vs MTF=%+.2f) — downgrading to HOLD",
+                            symbol, es.signal, mtf.signal)
+                journal.write("mtf_disagree", {"symbol": symbol, "ensemble": es.signal,
+                                               "mtf_signal": mtf.signal, "mtf_reason": mtf.reason})
+                es_signal_str = "HOLD"
+            else:
+                es_signal_str = es.signal
+        else:
+            es_signal_str = es.signal
+
+        signal = SignalResult(es_signal_str, float(bars["close"].iloc[-1]), 0, 0)
+        log_ensemble_decision(journal, symbol, es)
     else:
         signal = moving_average_signal(bars, settings.fast_ma, settings.slow_ma)
-
     position_qty = broker.position_qty(symbol)
     has_open_order = broker.has_open_order(symbol)
 
@@ -259,6 +301,62 @@ def _trade_symbol(
             return
         action = "BUY"
 
+        # ── Macro filters (free; yfinance) ────────────────────────────────
+        if settings.use_spy_trend_filter:
+            from ai_trading.strategy.market_filters import spy_trend_ok
+            ok, reason = spy_trend_ok(window=settings.spy_trend_window)
+            if not ok:
+                logger.info("SPY trend filter blocked BUY %s: %s", symbol, reason)
+                journal.write("spy_trend_reject", {"symbol": symbol, "reason": reason})
+                return
+
+        vix_mult = 1.0
+        if settings.use_vix_size_scaling:
+            from ai_trading.strategy.market_filters import vix_size_multiplier
+            vix_mult, vix_reason = vix_size_multiplier(
+                full_below=settings.vix_full_below,
+                half_above=settings.vix_half_above,
+                zero_above=settings.vix_zero_above,
+            )
+            journal.write("vix_scale", {"symbol": symbol, "multiplier": round(vix_mult, 3), "reason": vix_reason})
+            if vix_mult <= 0:
+                logger.info("VIX scaling blocked BUY %s: %s", symbol, vix_reason)
+                return
+
+        if settings.earnings_blackout_days > 0:
+            from ai_trading.strategy.market_filters import in_earnings_blackout
+            ec = in_earnings_blackout(symbol, blackout_days=settings.earnings_blackout_days)
+            if ec.blocked:
+                logger.info("Earnings blackout blocked BUY %s: %s", symbol, ec.reason)
+                journal.write("earnings_blackout_reject", {"symbol": symbol, "reason": ec.reason})
+                return
+
+        if settings.use_volume_confirmation:
+            from ai_trading.strategy.market_filters import volume_confirms
+            ok, reason = volume_confirms(bars, min_ratio=settings.volume_min_ratio)
+            if not ok:
+                logger.info("Volume filter blocked BUY %s: %s", symbol, reason)
+                journal.write("volume_reject", {"symbol": symbol, "reason": reason})
+                return
+
+        # Meta-label filter: skip trade if model says it's unlikely to win
+        meta_prob = 1.0
+        if settings.use_meta_label:
+            try:
+                from ai_trading.ml.meta_label import MetaModel
+                import os as _os
+                if _os.path.exists(settings.meta_model_path):
+                    mm = MetaModel.load(settings.meta_model_path)
+                    meta_prob = mm.predict_proba_win(bars)
+                    journal.write("meta_label", {"symbol": symbol, "prob_win": round(meta_prob, 4)})
+                    if meta_prob < settings.meta_min_prob:
+                        logger.info("Meta-label rejected %s (p=%.3f < %.3f)",
+                                    symbol, meta_prob, settings.meta_min_prob)
+                        journal.write("meta_label_reject", {"symbol": symbol, "prob": meta_prob})
+                        return
+            except Exception as exc:
+                logger.warning("Meta-label inference failed for %s: %s", symbol, exc)
+
         # Correlation filter: block if too correlated with existing positions
         if settings.correlation_filter_threshold > 0:
             existing_positions = [p["symbol"] for p in broker.all_positions()]
@@ -276,17 +374,107 @@ def _trade_symbol(
                     notifier.notify("risk_reject", f"Correlation filter: {reason}")
                     return
 
-        # Kelly sizing
-        if settings.use_kelly_sizing:
-            requested_qty = risk.kelly_qty(
-                win_rate=settings.kelly_win_rate,
-                avg_win=settings.kelly_avg_win,
-                avg_loss=settings.kelly_avg_loss,
+        # Correlation-aware size scaling (soft alternative to the hard filter above)
+        size_multiplier = 1.0
+        if settings.use_correlation_scaling:
+            existing_positions = [p["symbol"] for p in broker.all_positions()]
+            existing_with_bars = [s for s in existing_positions if s in all_bars]
+            if existing_with_bars:
+                size_multiplier = correlation_scale(
+                    new_symbol=symbol,
+                    existing_symbols=existing_with_bars,
+                    bars_by_symbol=all_bars,
+                    soft_threshold=settings.correlation_scale_soft,
+                    hard_threshold=settings.correlation_scale_hard,
+                )
+                if size_multiplier < 1.0:
+                    journal.write("correlation_scale", {"symbol": symbol, "multiplier": round(size_multiplier, 3)})
+
+        # ATR-based risk sizing takes precedence over Kelly when enabled
+        if settings.use_atr_stops:
+            sz = compute_atr_stop_and_size(
+                bars,
+                entry=signal.close,
+                equity=float(account["equity"]),
+                risk_pct=settings.risk_per_trade_pct,
+                atr_period=settings.atr_period,
+                atr_mult=settings.atr_stop_mult,
+                max_shares=settings.max_shares,
+            )
+            requested_qty = max(1, int(sz.qty * size_multiplier)) if sz.qty > 0 else 0
+            journal.write("atr_sizing", {
+                "symbol": symbol, "qty": requested_qty,
+                "stop_price": round(sz.stop_price, 2), "atr": round(sz.atr_value, 3),
+                "risk_per_share": round(sz.risk_per_share, 3),
+                "size_multiplier": round(size_multiplier, 3),
+            })
+        elif settings.use_vol_targeting:
+            from ai_trading.risk.portfolio_sizing import vol_targeted_qty
+            requested_qty = vol_targeted_qty(
+                bars=bars, entry=signal.close, equity=float(account["equity"]),
+                target_vol_pct=settings.target_vol_pct,
+                max_position_pct=settings.max_position_pct,
+                max_shares=settings.max_shares,
+            )
+            requested_qty = max(0, int(requested_qty * size_multiplier))
+            journal.write("vol_target_sizing", {
+                "symbol": symbol, "qty": requested_qty,
+                "target_vol_pct": settings.target_vol_pct,
+                "size_multiplier": round(size_multiplier, 3),
+            })
+        elif settings.use_kelly_sizing:
+            base_qty = risk.kelly_qty(
+                win_rate=0.52,   # Conservative default; replace with historical win rate
+                avg_win=0.015,
+                avg_loss=0.01,
                 equity=float(account["equity"]),
                 price=signal.close,
             )
+            requested_qty = max(0, int(base_qty * size_multiplier))
         else:
-            requested_qty = settings.max_shares
+            requested_qty = max(0, int(settings.max_shares * size_multiplier))
+
+        # Apply VIX size scaling (after any sizing method)
+        if settings.use_vix_size_scaling and vix_mult < 1.0:
+            requested_qty = max(0, int(requested_qty * vix_mult))
+
+        # Optional: scale by meta-label win probability
+        if settings.use_meta_label and settings.meta_size_scale:
+            requested_qty = max(1, int(requested_qty * meta_prob)) if requested_qty > 0 else 0
+
+        # Portfolio heat cap: total $-at-risk across open positions
+        if settings.use_atr_stops and settings.max_portfolio_heat_pct > 0:
+            from ai_trading.risk.portfolio_sizing import portfolio_heat_check
+            new_risk = requested_qty * sz.risk_per_share if 'sz' in locals() else 0.0
+            # Approximate existing heat: positions × ATR stop distance
+            existing = {}
+            for p in broker.all_positions():
+                sp = p["symbol"]
+                if sp == symbol or sp not in all_bars:
+                    continue
+                try:
+                    p_sz = compute_atr_stop_and_size(
+                        all_bars[sp], entry=float(p.get("current_price", p.get("avg_entry_price", 0)) or 0),
+                        equity=float(account["equity"]),
+                        risk_pct=settings.risk_per_trade_pct,
+                        atr_period=settings.atr_period, atr_mult=settings.atr_stop_mult,
+                        max_shares=settings.max_shares,
+                    )
+                    existing[sp] = float(p.get("qty", 0)) * p_sz.risk_per_share
+                except Exception:
+                    continue
+            heat = portfolio_heat_check(
+                open_risks=existing, new_symbol=symbol,
+                new_dollar_risk=new_risk, equity=float(account["equity"]),
+                max_heat_pct=settings.max_portfolio_heat_pct,
+            )
+            if not heat.allowed:
+                logger.info("Portfolio heat blocked BUY %s: %s", symbol, heat.reason)
+                journal.write("heat_reject", {"symbol": symbol, "reason": heat.reason,
+                                              "current_pct": round(heat.current_heat_pct, 2),
+                                              "projected_pct": round(heat.projected_heat_pct, 2)})
+                return
+
 
     elif effective_signal == "SELL" and position_qty > 0:
         action = "SELL"
@@ -397,17 +585,30 @@ def _trade_symbol(
             logger.warning("Order status: %s", fill_result["status"])
 
         if (
-            settings.stop_loss_pct > 0
+            (settings.stop_loss_pct > 0 or settings.use_atr_stops)
             and action == "BUY"
             and fill_result["status"] == "filled"
             and fill_result["filled_avg_price"] > 0
         ):
-            stop_price = fill_result["filled_avg_price"] * (1 - settings.stop_loss_pct / 100.0)
+            entry_px = fill_result["filled_avg_price"]
+            if settings.use_atr_stops:
+                sz = compute_atr_stop_and_size(
+                    bars, entry=entry_px, equity=float(account["equity"]),
+                    risk_pct=settings.risk_per_trade_pct,
+                    atr_period=settings.atr_period, atr_mult=settings.atr_stop_mult,
+                    max_shares=settings.max_shares,
+                )
+                stop_price = sz.stop_price
+                stop_reason = f"atr*{settings.atr_stop_mult} (ATR={sz.atr_value:.2f})"
+            else:
+                stop_price = entry_px * (1 - settings.stop_loss_pct / 100.0)
+                stop_reason = f"{settings.stop_loss_pct}% fixed"
             try:
                 sl_order = broker.submit_stop_loss(symbol, fill_result["filled_qty"], stop_price)
                 journal.write(
                     "stop_loss",
-                    {"order_id": str(sl_order.id), "stop_price": stop_price, "qty": fill_result["filled_qty"]},
+                    {"order_id": str(sl_order.id), "stop_price": stop_price,
+                     "qty": fill_result["filled_qty"], "reason": stop_reason},
                 )
             except Exception as sl_exc:
                 logger.warning("Failed to place stop-loss for %s: %s", symbol, sl_exc)
@@ -652,6 +853,23 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
                 trades_today=risk._trades_today,
                 pnl_today=equity - last_equity,
             )
+
+        # Options cycle (optional) — runs after equity trading
+        if getattr(settings, "options_enabled", False):
+            try:
+                from ai_trading.options.integration import run_options_cycle
+                # Only run options on configured symbols (not full universe).
+                opt_symbols = cfg_symbols if cfg_symbols else [settings.symbol.upper()]
+                run_options_cycle(
+                    settings=settings,
+                    candidate_symbols=opt_symbols,
+                    journal=journal,
+                    notifier=notifier,
+                    logger=logger,
+                )
+            except Exception as exc:
+                logger.exception("Options cycle failed: %s", exc)
+                journal.write("option_cycle_error", {"error": str(exc)})
 
     except Exception as exc:
         risk.register_error()

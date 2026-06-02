@@ -173,6 +173,79 @@ class Settings:
     # Alert if model file is older than this many days (0 = disabled)
     ml_model_max_age_days: int = 0
 
+    # --- ATR-based risk sizing (new) ---
+    use_atr_stops: bool = False
+    atr_stop_mult: float = 2.0
+    atr_period: int = 14
+    risk_per_trade_pct: float = 0.5  # % of equity to risk on entry→stop move
+
+    # --- Adaptive thresholds + ensemble (new) ---
+    use_adaptive_thresholds: bool = False
+    base_buy_threshold: float = 0.15
+    base_sell_threshold: float = -0.15
+    use_ensemble_signal: bool = False  # if True, use ensemble instead of MA crossover
+
+    # --- Multi-timeframe confirmation (new) ---
+    use_mtf_confirmation: bool = False
+    mtf_timeframes: str = "1Day,1Hour"
+
+    # --- Bar cache (new) ---
+    cache_enabled: bool = False
+    cache_dir: str = ".cache/bars"
+    cache_ttl_sec: int = 60
+
+    # --- Correlation-aware size scaling (new, soft alternative to filter) ---
+    correlation_scale_soft: float = 0.6
+    correlation_scale_hard: float = 0.9
+    use_correlation_scaling: bool = False
+
+    # --- Macro filters (new) ---
+    use_spy_trend_filter: bool = False
+    spy_trend_window: int = 200
+    use_vix_size_scaling: bool = False
+    vix_full_below: float = 20.0
+    vix_half_above: float = 25.0
+    vix_zero_above: float = 35.0
+    earnings_blackout_days: int = 0
+    use_volume_confirmation: bool = False
+    volume_min_ratio: float = 0.8
+    use_spread_filter: bool = False
+    max_spread_bps: float = 10.0
+
+    # --- Portfolio sizing & exits (new) ---
+    use_vol_targeting: bool = False
+    target_vol_pct: float = 1.0
+    max_position_pct: float = 20.0
+    max_portfolio_heat_pct: float = 6.0
+    use_trailing_atr_stop: bool = False
+    trailing_atr_mult: float = 2.5
+    time_stop_max_bars: int = 0
+    time_stop_min_r: float = 0.5
+    partial_take_r: float = 1.0      # R-multiple to take partial profit
+    breakeven_r: float = 1.0          # R-multiple to move stop to breakeven
+
+    # --- Meta-labeling (new) ---
+    use_meta_label: bool = False
+    meta_model_path: str = "models/meta_label.joblib"
+    meta_min_prob: float = 0.55
+    meta_size_scale: bool = False    # scale qty by predicted probability
+
+    # --- Options trading (new) ---
+    options_enabled: bool = False
+    options_strategies: str = "long_call,csp,bull_call"
+    options_qty: int = 1
+    options_min_pop: float = 0.60
+    options_max_risk_pct: float = 1.0       # % of options BP per trade
+    options_min_dte: int = 21
+    options_max_dte: int = 45
+    options_target_delta: float = 0.30
+    options_spread_width: float = 5.0
+    options_data_source: str = "auto"        # 'auto' | 'alpaca' | 'yfinance'
+    options_top_n: int = 5
+    options_slippage_pct: float = 0.0
+    options_allow_naked: bool = False
+    options_dry_run: bool = True             # safe default: log, don't submit
+
     @classmethod
     def from_env(cls) -> "Settings":
         api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -240,14 +313,61 @@ class Settings:
             dip_require_uptrend=os.getenv("BOT_DIP_REQUIRE_UPTREND", "true").lower() == "true",
             partial_profit_trigger_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRIGGER_PCT", "0")),
             partial_profit_sell_pct=max(1.0, min(99.0, float(os.getenv("BOT_PARTIAL_PROFIT_SELL_PCT", "50")))),
-            partial_profit_max_hold_bars=max(0, int(os.getenv("BOT_PARTIAL_PROFIT_MAX_HOLD_BARS", "0"))),
-            partial_profit_trailing_stop_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRAILING_STOP_PCT", "0")),
-            error_streak_decay_hours=float(os.getenv("BOT_ERROR_STREAK_DECAY_HOURS", "0")),
-            strategy_mode=os.getenv("BOT_STRATEGY_MODE", "ma").lower(),
-            risk_state_file=os.getenv("BOT_RISK_STATE_FILE", "logs/risk_state.json"),
-            data_cache_ttl_sec=max(0, int(os.getenv("BOT_DATA_CACHE_TTL_SEC", "300"))),
-            sentiment_cache_ttl_sec=max(0, int(os.getenv("BOT_SENTIMENT_CACHE_TTL_SEC", "600"))),
-            ml_model_max_age_days=max(0, int(os.getenv("BOT_ML_MODEL_MAX_AGE_DAYS", "0"))),
+            use_atr_stops=os.getenv("BOT_USE_ATR_STOPS", "false").lower() == "true",
+            atr_stop_mult=float(os.getenv("BOT_ATR_STOP_MULT", "2.0")),
+            atr_period=max(2, int(os.getenv("BOT_ATR_PERIOD", "14"))),
+            risk_per_trade_pct=float(os.getenv("BOT_RISK_PER_TRADE_PCT", "0.5")),
+            use_adaptive_thresholds=os.getenv("BOT_USE_ADAPTIVE_THRESHOLDS", "false").lower() == "true",
+            base_buy_threshold=float(os.getenv("BOT_BASE_BUY_THRESHOLD", "0.15")),
+            base_sell_threshold=float(os.getenv("BOT_BASE_SELL_THRESHOLD", "-0.15")),
+            use_ensemble_signal=os.getenv("BOT_USE_ENSEMBLE_SIGNAL", "false").lower() == "true",
+            use_mtf_confirmation=os.getenv("BOT_USE_MTF_CONFIRMATION", "false").lower() == "true",
+            mtf_timeframes=os.getenv("BOT_MTF_TIMEFRAMES", "1Day,1Hour"),
+            cache_enabled=os.getenv("BOT_CACHE_ENABLED", "false").lower() == "true",
+            cache_dir=os.getenv("BOT_CACHE_DIR", ".cache/bars"),
+            cache_ttl_sec=max(0, int(os.getenv("BOT_CACHE_TTL_SEC", "60"))),
+            use_correlation_scaling=os.getenv("BOT_USE_CORRELATION_SCALING", "false").lower() == "true",
+            correlation_scale_soft=float(os.getenv("BOT_CORRELATION_SCALE_SOFT", "0.6")),
+            correlation_scale_hard=float(os.getenv("BOT_CORRELATION_SCALE_HARD", "0.9")),
+            use_spy_trend_filter=os.getenv("BOT_USE_SPY_TREND_FILTER", "false").lower() == "true",
+            spy_trend_window=max(50, int(os.getenv("BOT_SPY_TREND_WINDOW", "200"))),
+            use_vix_size_scaling=os.getenv("BOT_USE_VIX_SIZE_SCALING", "false").lower() == "true",
+            vix_full_below=float(os.getenv("BOT_VIX_FULL_BELOW", "20")),
+            vix_half_above=float(os.getenv("BOT_VIX_HALF_ABOVE", "25")),
+            vix_zero_above=float(os.getenv("BOT_VIX_ZERO_ABOVE", "35")),
+            earnings_blackout_days=max(0, int(os.getenv("BOT_EARNINGS_BLACKOUT_DAYS", "0"))),
+            use_volume_confirmation=os.getenv("BOT_USE_VOLUME_CONFIRMATION", "false").lower() == "true",
+            volume_min_ratio=float(os.getenv("BOT_VOLUME_MIN_RATIO", "0.8")),
+            use_spread_filter=os.getenv("BOT_USE_SPREAD_FILTER", "false").lower() == "true",
+            max_spread_bps=float(os.getenv("BOT_MAX_SPREAD_BPS", "10")),
+            use_vol_targeting=os.getenv("BOT_USE_VOL_TARGETING", "false").lower() == "true",
+            target_vol_pct=float(os.getenv("BOT_TARGET_VOL_PCT", "1.0")),
+            max_position_pct=float(os.getenv("BOT_MAX_POSITION_PCT", "20")),
+            max_portfolio_heat_pct=float(os.getenv("BOT_MAX_PORTFOLIO_HEAT_PCT", "6")),
+            use_trailing_atr_stop=os.getenv("BOT_USE_TRAILING_ATR_STOP", "false").lower() == "true",
+            trailing_atr_mult=float(os.getenv("BOT_TRAILING_ATR_MULT", "2.5")),
+            time_stop_max_bars=max(0, int(os.getenv("BOT_TIME_STOP_MAX_BARS", "0"))),
+            time_stop_min_r=float(os.getenv("BOT_TIME_STOP_MIN_R", "0.5")),
+            partial_take_r=float(os.getenv("BOT_PARTIAL_TAKE_R", "1.0")),
+            breakeven_r=float(os.getenv("BOT_BREAKEVEN_R", "1.0")),
+            use_meta_label=os.getenv("BOT_USE_META_LABEL", "false").lower() == "true",
+            meta_model_path=os.getenv("BOT_META_MODEL_PATH", "models/meta_label.joblib"),
+            meta_min_prob=float(os.getenv("BOT_META_MIN_PROB", "0.55")),
+            meta_size_scale=os.getenv("BOT_META_SIZE_SCALE", "false").lower() == "true",
+            options_enabled=os.getenv("BOT_OPTIONS_ENABLED", "false").lower() == "true",
+            options_strategies=os.getenv("BOT_OPTIONS_STRATEGIES", "long_call,csp,bull_call"),
+            options_qty=max(1, int(os.getenv("BOT_OPTIONS_QTY", "1"))),
+            options_min_pop=float(os.getenv("BOT_OPTIONS_MIN_POP", "0.60")),
+            options_max_risk_pct=float(os.getenv("BOT_OPTIONS_MAX_RISK_PCT", "1.0")),
+            options_min_dte=max(0, int(os.getenv("BOT_OPTIONS_MIN_DTE", "21"))),
+            options_max_dte=max(1, int(os.getenv("BOT_OPTIONS_MAX_DTE", "45"))),
+            options_target_delta=float(os.getenv("BOT_OPTIONS_TARGET_DELTA", "0.30")),
+            options_spread_width=float(os.getenv("BOT_OPTIONS_SPREAD_WIDTH", "5.0")),
+            options_data_source=os.getenv("BOT_OPTIONS_DATA_SOURCE", "auto").lower(),
+            options_top_n=max(1, int(os.getenv("BOT_OPTIONS_TOP_N", "5"))),
+            options_slippage_pct=float(os.getenv("BOT_OPTIONS_SLIPPAGE_PCT", "0")),
+            options_allow_naked=os.getenv("BOT_OPTIONS_ALLOW_NAKED", "false").lower() == "true",
+            options_dry_run=os.getenv("BOT_OPTIONS_DRY_RUN", "true").lower() == "true",
         )
 
     def validate(self) -> None:
