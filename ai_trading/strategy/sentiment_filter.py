@@ -9,12 +9,48 @@ This is a conservative filter — it only BLOCKS trades, never initiates them.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from ai_trading.data.news_sentiment import NewsArticle, fetch_news
 from ai_trading.ml.sentiment import SentimentAnalyzer
 
 logger = logging.getLogger(__name__)
+
+
+# --- Sentiment cache (#12) ---
+class _SentimentCache:
+    """In-memory cache for sentiment results to avoid redundant API calls."""
+
+    def __init__(self, ttl_sec: int = 600) -> None:
+        self.ttl_sec = ttl_sec
+        self._store: dict[str, tuple[float, float]] = {}  # symbol -> (timestamp, score)
+
+    def get(self, symbol: str) -> float | None:
+        if self.ttl_sec <= 0:
+            return None
+        entry = self._store.get(symbol)
+        if entry is None:
+            return None
+        ts, score = entry
+        if time.time() - ts > self.ttl_sec:
+            del self._store[symbol]
+            return None
+        return score
+
+    def put(self, symbol: str, score: float) -> None:
+        if self.ttl_sec <= 0:
+            return
+        self._store[symbol] = (time.time(), score)
+
+
+_sentiment_cache = _SentimentCache(ttl_sec=600)
+
+
+def configure_sentiment_cache(ttl_sec: int) -> None:
+    """Update the sentiment cache TTL. Called from bot startup."""
+    global _sentiment_cache
+    _sentiment_cache = _SentimentCache(ttl_sec=ttl_sec)
 
 
 @dataclass(slots=True)
@@ -66,6 +102,12 @@ def apply_sentiment_filter(
             reason="No action to filter",
         )
 
+    # Check cache first
+    cached_score = _sentiment_cache.get(symbol)
+    if cached_score is not None:
+        score = cached_score
+        return _evaluate_sentiment(signal, score, buy_threshold, sell_threshold, cached=True)
+
     # Fetch news and compute sentiment
     try:
         articles = fetch_news(
@@ -98,7 +140,22 @@ def apply_sentiment_filter(
     aggregate = analyzer.aggregate_sentiment(articles)
     score = aggregate.score
 
-    # Apply filter logic
+    # Cache the result
+    _sentiment_cache.put(symbol, score)
+
+    return _evaluate_sentiment(signal, score, buy_threshold, sell_threshold, cached=False)
+
+
+def _evaluate_sentiment(
+    signal: str,
+    score: float,
+    buy_threshold: float,
+    sell_threshold: float,
+    cached: bool = False,
+) -> SentimentFilterResult:
+    """Apply sentiment thresholds and return filter result."""
+    source_note = " (cached)" if cached else ""
+
     if signal == "BUY" and score < buy_threshold:
         return SentimentFilterResult(
             original_signal="BUY",
@@ -106,8 +163,7 @@ def apply_sentiment_filter(
             sentiment_score=score,
             blocked=True,
             reason=(
-                f"BUY blocked: sentiment {score:.3f} < threshold {buy_threshold} "
-                f"({aggregate.num_negative} negative articles)"
+                f"BUY blocked: sentiment {score:.3f} < threshold {buy_threshold}{source_note}"
             ),
         )
 
@@ -118,8 +174,7 @@ def apply_sentiment_filter(
             sentiment_score=score,
             blocked=True,
             reason=(
-                f"SELL blocked: sentiment {score:.3f} > threshold {sell_threshold} "
-                f"({aggregate.num_positive} positive articles)"
+                f"SELL blocked: sentiment {score:.3f} > threshold {sell_threshold}{source_note}"
             ),
         )
 
@@ -128,5 +183,5 @@ def apply_sentiment_filter(
         filtered_signal=signal,
         sentiment_score=score,
         blocked=False,
-        reason=f"Sentiment {score:.3f} within thresholds, signal passes",
+        reason=f"Sentiment {score:.3f} within thresholds, signal passes{source_note}",
     )

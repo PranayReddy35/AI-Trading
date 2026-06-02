@@ -72,7 +72,9 @@ def is_too_correlated(
         if existing not in corr_matrix.columns:
             continue
         corr = corr_matrix.loc[new_symbol, existing]
-        if not np.isnan(corr) and abs(corr) >= threshold:
+        if not np.isnan(corr) and corr >= threshold:
+            # Only block positive correlations — negative correlations are
+            # hedges and actually improve portfolio diversification.
             reason = (
                 f"{new_symbol} correlation with {existing} is {corr:.2f} "
                 f"(threshold {threshold:.2f})"
