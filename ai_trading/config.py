@@ -88,6 +88,12 @@ class Settings:
     kelly_fraction: float = 0.5
     # Max shares Kelly is allowed to recommend (caps Kelly output)
     kelly_max_shares: int = 10
+    # Historical win rate for Kelly (0-1)
+    kelly_win_rate: float = 0.52
+    # Average winning trade return (positive decimal, e.g. 0.015 = 1.5%)
+    kelly_avg_win: float = 0.015
+    # Average losing trade return (positive decimal, e.g. 0.01 = 1%)
+    kelly_avg_loss: float = 0.01
 
     # --- Trailing stop-loss ---
     # Trailing stop as % below peak price (0 = disabled)
@@ -138,6 +144,34 @@ class Settings:
     partial_profit_trigger_pct: float = 0.0
     # How much of the position to sell when trigger fires (default 50 = sell half, hold rest forever)
     partial_profit_sell_pct: float = 50.0
+    # Max bars to hold remainder after partial profit (0 = hold indefinitely)
+    partial_profit_max_hold_bars: int = 0
+    # Trailing stop % for remainder after partial profit (0 = disabled)
+    partial_profit_trailing_stop_pct: float = 0.0
+
+    # --- Error streak decay ---
+    # Hours after which consecutive error streak resets (0 = never resets until manual clear)
+    error_streak_decay_hours: float = 0.0
+
+    # --- Strategy mode ---
+    # Which strategy to use for signal generation: "ma" (basic MA) or "ensemble" (multi-strategy)
+    strategy_mode: str = "ma"
+
+    # --- Risk state persistence ---
+    # Path to persist risk manager state (empty = no persistence)
+    risk_state_file: str = "logs/risk_state.json"
+
+    # --- Data caching ---
+    # Cache TTL in seconds for market data (0 = no caching)
+    data_cache_ttl_sec: int = 300
+
+    # --- Sentiment caching ---
+    # Cache TTL in seconds for sentiment data (0 = no caching)
+    sentiment_cache_ttl_sec: int = 600
+
+    # --- ML model staleness ---
+    # Alert if model file is older than this many days (0 = disabled)
+    ml_model_max_age_days: int = 0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -187,6 +221,9 @@ class Settings:
             use_kelly_sizing=os.getenv("BOT_USE_KELLY_SIZING", "false").lower() == "true",
             kelly_fraction=float(os.getenv("BOT_KELLY_FRACTION", "0.5")),
             kelly_max_shares=max(1, int(os.getenv("BOT_KELLY_MAX_SHARES", "10"))),
+            kelly_win_rate=float(os.getenv("BOT_KELLY_WIN_RATE", "0.52")),
+            kelly_avg_win=float(os.getenv("BOT_KELLY_AVG_WIN", "0.015")),
+            kelly_avg_loss=float(os.getenv("BOT_KELLY_AVG_LOSS", "0.01")),
             trailing_stop_pct=float(os.getenv("BOT_TRAILING_STOP_PCT", "0")),
             portfolio_drawdown_halt_pct=float(os.getenv("BOT_PORTFOLIO_DRAWDOWN_HALT_PCT", "0")),
             correlation_filter_threshold=float(os.getenv("BOT_CORRELATION_FILTER_THRESHOLD", "0")),
@@ -203,6 +240,14 @@ class Settings:
             dip_require_uptrend=os.getenv("BOT_DIP_REQUIRE_UPTREND", "true").lower() == "true",
             partial_profit_trigger_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRIGGER_PCT", "0")),
             partial_profit_sell_pct=max(1.0, min(99.0, float(os.getenv("BOT_PARTIAL_PROFIT_SELL_PCT", "50")))),
+            partial_profit_max_hold_bars=max(0, int(os.getenv("BOT_PARTIAL_PROFIT_MAX_HOLD_BARS", "0"))),
+            partial_profit_trailing_stop_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRAILING_STOP_PCT", "0")),
+            error_streak_decay_hours=float(os.getenv("BOT_ERROR_STREAK_DECAY_HOURS", "0")),
+            strategy_mode=os.getenv("BOT_STRATEGY_MODE", "ma").lower(),
+            risk_state_file=os.getenv("BOT_RISK_STATE_FILE", "logs/risk_state.json"),
+            data_cache_ttl_sec=max(0, int(os.getenv("BOT_DATA_CACHE_TTL_SEC", "300"))),
+            sentiment_cache_ttl_sec=max(0, int(os.getenv("BOT_SENTIMENT_CACHE_TTL_SEC", "600"))),
+            ml_model_max_age_days=max(0, int(os.getenv("BOT_ML_MODEL_MAX_AGE_DAYS", "0"))),
         )
 
     def validate(self) -> None:
@@ -222,6 +267,88 @@ class Settings:
             raise ValueError("kelly_fraction must be in (0, 1].")
         if self.trailing_stop_pct < 0 or self.trailing_stop_pct > 50:
             raise ValueError("trailing_stop_pct must be 0-50.")
+        if self.strategy_mode not in ("ma", "ensemble"):
+            raise ValueError("strategy_mode must be 'ma' or 'ensemble'.")
+        if self.kelly_win_rate <= 0 or self.kelly_win_rate >= 1:
+            raise ValueError("kelly_win_rate must be in (0, 1).")
+        if self.kelly_avg_win <= 0:
+            raise ValueError("kelly_avg_win must be > 0.")
+        if self.kelly_avg_loss <= 0:
+            raise ValueError("kelly_avg_loss must be > 0.")
+
+    # --- Configuration presets (#15) ---
+    @classmethod
+    def conservative(cls, api_key: str = "", api_secret: str = "") -> "Settings":
+        """Preset for conservative, low-risk trading."""
+        return cls(
+            api_key=api_key or os.getenv("APCA_API_KEY_ID", ""),
+            api_secret=api_secret or os.getenv("APCA_API_SECRET_KEY", ""),
+            max_shares=1,
+            max_daily_trades=1,
+            daily_loss_limit_pct=2.0,
+            max_portfolio_exposure_pct=50.0,
+            stop_loss_pct=3.0,
+            trailing_stop_pct=5.0,
+            trade_cooldown_sec=600,
+            portfolio_drawdown_halt_pct=5.0,
+            use_kelly_sizing=True,
+            kelly_fraction=0.25,
+            kelly_max_shares=3,
+            strategy_mode="ensemble",
+            use_sentiment_filter=True,
+            correlation_filter_threshold=0.70,
+            error_streak_decay_hours=2.0,
+        )
+
+    @classmethod
+    def aggressive(cls, api_key: str = "", api_secret: str = "") -> "Settings":
+        """Preset for aggressive, higher-risk trading."""
+        return cls(
+            api_key=api_key or os.getenv("APCA_API_KEY_ID", ""),
+            api_secret=api_secret or os.getenv("APCA_API_SECRET_KEY", ""),
+            max_shares=10,
+            max_daily_trades=5,
+            daily_loss_limit_pct=5.0,
+            max_portfolio_exposure_pct=90.0,
+            stop_loss_pct=5.0,
+            trailing_stop_pct=8.0,
+            trade_cooldown_sec=60,
+            use_kelly_sizing=True,
+            kelly_fraction=0.75,
+            kelly_max_shares=20,
+            strategy_mode="ensemble",
+            dip_buy_enabled=True,
+            partial_profit_trigger_pct=10.0,
+            partial_profit_sell_pct=50.0,
+            partial_profit_max_hold_bars=20,
+            partial_profit_trailing_stop_pct=5.0,
+            correlation_filter_threshold=0.85,
+            error_streak_decay_hours=1.0,
+        )
+
+    @classmethod
+    def mean_reversion(cls, api_key: str = "", api_secret: str = "") -> "Settings":
+        """Preset optimized for mean-reversion / range-bound markets."""
+        return cls(
+            api_key=api_key or os.getenv("APCA_API_KEY_ID", ""),
+            api_secret=api_secret or os.getenv("APCA_API_SECRET_KEY", ""),
+            fast_ma=3,
+            slow_ma=10,
+            max_shares=5,
+            max_daily_trades=3,
+            daily_loss_limit_pct=3.0,
+            stop_loss_pct=2.0,
+            trailing_stop_pct=3.0,
+            trade_cooldown_sec=300,
+            use_kelly_sizing=True,
+            kelly_fraction=0.5,
+            strategy_mode="ensemble",
+            dip_buy_enabled=True,
+            dip_rsi_threshold=30.0,
+            dip_drop_pct=3.0,
+            use_sentiment_filter=True,
+            error_streak_decay_hours=2.0,
+        )
 
     def get_symbols(self) -> list[str]:
         """Return list of symbols to trade (multi-symbol or single)."""
