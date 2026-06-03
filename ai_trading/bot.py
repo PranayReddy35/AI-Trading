@@ -91,11 +91,18 @@ def _record_current_prices(
 ) -> None:
     """Fetch and journal latest price snapshot for symbols."""
     prices: dict[str, float] = {}
-    for symbol in symbols:
-        try:
-            prices[symbol] = float(broker.get_latest_price(symbol))
-        except Exception as exc:
-            logger.warning("Latest price fetch failed for %s: %s", symbol, exc)
+    try:
+        prices = broker.get_latest_prices(symbols)
+    except Exception as exc:
+        logger.warning("Batch latest price fetch failed: %s", exc)
+    if len(prices) < len(symbols):
+        for symbol in symbols:
+            if symbol in prices:
+                continue
+            try:
+                prices[symbol] = float(broker.get_latest_price(symbol))
+            except Exception as exc:
+                logger.warning("Latest price fetch failed for %s: %s", symbol, exc)
     if prices:
         journal.write("price_snapshot", {"prices": prices})
 

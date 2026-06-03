@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -185,11 +186,17 @@ def _overlay_latest_prices(results: list) -> list:
     latest = _latest_trade_prices(symbols)
     if not latest:
         return results
+    updated: list = []
     for r in results:
         px = latest.get(getattr(r, "symbol", ""))
         if px:
-            r.close = px
-    return results
+            try:
+                updated.append(replace(r, close=px))
+                continue
+            except Exception:
+                pass
+        updated.append(r)
+    return updated
 
 # ── Universe selector ─────────────────────────────────────────────────────────
 _universe_mode = st.sidebar.radio(

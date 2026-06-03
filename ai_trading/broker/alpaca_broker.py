@@ -320,3 +320,26 @@ class AlpacaBroker:
         if isinstance(trade, dict):
             return float(trade[symbol].price)
         return float(trade.price)
+
+    def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Get latest trade prices for symbols in a single request."""
+        if not symbols:
+            return {}
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        data_client = StockHistoricalDataClient(
+            self.client._api_key, self.client._secret_key
+        )
+        request = StockLatestTradeRequest(symbol_or_symbols=symbols)
+        trades = data_client.get_stock_latest_trade(request)
+        out: dict[str, float] = {}
+        if isinstance(trades, dict):
+            for sym, trade in trades.items():
+                try:
+                    px = float(getattr(trade, "price", 0.0) or 0.0)
+                    if px > 0:
+                        out[str(sym)] = px
+                except Exception:
+                    continue
+        return out
