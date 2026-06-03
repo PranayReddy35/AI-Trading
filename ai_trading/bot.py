@@ -83,6 +83,23 @@ def _maybe_retrain_ml(settings: Settings, symbol: str, logger) -> None:
         logger.warning("ML retraining check failed: %s", exc)
 
 
+def _record_current_prices(
+    symbols: list[str],
+    broker: AlpacaBroker,
+    journal: Journal,
+    logger,
+) -> None:
+    """Fetch and journal latest price snapshot for symbols."""
+    prices: dict[str, float] = {}
+    for symbol in symbols:
+        try:
+            prices[symbol] = float(broker.get_latest_price(symbol))
+        except Exception as exc:
+            logger.warning("Latest price fetch failed for %s: %s", symbol, exc)
+    if prices:
+        journal.write("price_snapshot", {"prices": prices})
+
+
 def _trade_symbol(
     symbol: str,
     settings: Settings,
@@ -758,11 +775,14 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
             notifier.notify("error", "Pre-flight check failed: account not ready")
             return
 
-        # Market-hours gate: when the market is closed, skip everything.
-        # No signals, no notifications, no orders — nothing to do until market opens.
+        cfg_symbols = settings.get_symbols()
+
+        # Market-hours gate: when the market is closed, still fetch latest prices.
+        # Order flow remains disabled until regular market hours resume.
         market_is_open = broker.is_market_open()
         if not market_is_open:
-            logger.info("Market is closed — skipping cycle entirely.")
+            logger.info("Market is closed — recording latest prices and skipping order cycle.")
+            _record_current_prices(cfg_symbols, broker, journal, logger)
             return
 
         account = broker.account_state()
@@ -775,7 +795,6 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         if settings.ml_model_max_age_days > 0:
             _check_ml_model_staleness(settings, notifier, logger)
 
-        cfg_symbols = settings.get_symbols()
         # If no explicit symbol list configured, pull the full tradable universe
         # from Alpaca (NYSE + NASDAQ + ARCA + BATS + AMEX, clean tickers only).
         if len(cfg_symbols) == 1 and cfg_symbols[0] == settings.symbol.upper() and not settings.symbols:
