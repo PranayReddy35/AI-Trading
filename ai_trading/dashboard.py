@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -144,6 +145,58 @@ def _snapshot_filter(
         return passed
     except Exception:
         return symbols  # fallback: no filter
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _latest_trade_prices(symbols: tuple[str, ...]) -> dict[str, float]:
+    """Fetch latest trade prices from Alpaca for a symbol batch."""
+    if not symbols:
+        return {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        client = StockHistoricalDataClient(
+            os.environ["APCA_API_KEY_ID"],
+            os.environ["APCA_API_SECRET_KEY"],
+        )
+        req = StockLatestTradeRequest(symbol_or_symbols=list(symbols))
+        trades = client.get_stock_latest_trade(req)
+        out: dict[str, float] = {}
+        if isinstance(trades, dict):
+            for sym, trade in trades.items():
+                try:
+                    px = float(getattr(trade, "price", 0.0) or 0.0)
+                    if px > 0:
+                        out[str(sym)] = px
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return {}
+
+
+def _overlay_latest_prices(results: list) -> list:
+    """Overwrite scanner close with latest trade prices when available."""
+    if not results:
+        return results
+    symbols = tuple(dict.fromkeys(r.symbol for r in results if getattr(r, "symbol", "")))
+    if not symbols:
+        return results
+    latest = _latest_trade_prices(symbols)
+    if not latest:
+        return results
+    updated: list = []
+    for r in results:
+        px = latest.get(getattr(r, "symbol", ""))
+        if px:
+            try:
+                updated.append(replace(r, close=px))
+                continue
+            except Exception:
+                pass
+        updated.append(r)
+    return updated
 
 # ── Universe selector ─────────────────────────────────────────────────────────
 _universe_mode = st.sidebar.radio(
@@ -973,6 +1026,7 @@ elif active_page == "🔍 Live Scanner":
                         results = scan(symbols_to_scan, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=scanner_top_n)
                 else:
                     results = scan(symbols_to_scan, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=scanner_top_n)
+                results = _overlay_latest_prices(results)
                 st.session_state["scanner_results"] = results
                 st.session_state["scanner_ts"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
                 st.session_state["scanner_mode"] = "live" if market_open else "eod"
@@ -1301,6 +1355,7 @@ elif active_page == "💸 Sell Scanner":
                             raw = scan(sell_syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(sell_syms))
                     else:
                         raw = scan(sell_syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(sell_syms))
+                    raw = _overlay_latest_prices(raw)
                 except Exception as exc:
                     st.error(f"Sell scan failed: {exc}")
                     raw = []
@@ -1633,6 +1688,7 @@ elif active_page == "🧮 Position Advisor":
                                 scan_out = scan([adv_symbol], fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=1)
                         else:
                             scan_out = scan([adv_symbol], fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=1)
+                        scan_out = _overlay_latest_prices(scan_out)
                     except Exception as exc:
                         scan_out = []
                         st.error(f"Could not fetch market data: {exc}")
@@ -1769,6 +1825,7 @@ elif active_page == "🧮 Position Advisor":
                                     scan_out = scan(syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(syms))
                             else:
                                 scan_out = scan(syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(syms))
+                            scan_out = _overlay_latest_prices(scan_out)
                         except Exception as exc:
                             scan_out = []
                             st.error(f"Scan failed: {exc}")
@@ -2116,4 +2173,3 @@ if _autorefresh_on and not _skip_refresh:
     import time as _time
     _time.sleep(int(_autorefresh_sec))
     st.rerun()
-
