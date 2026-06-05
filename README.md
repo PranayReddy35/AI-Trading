@@ -63,6 +63,8 @@ Production-ready module structure:
 
 ## Setup
 
+For a step-by-step local operating guide, including what to do when Codex/AI credits are exhausted, see [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md).
+
 ```bash
 cd AI-Trading
 python -m venv .venv
