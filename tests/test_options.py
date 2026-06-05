@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -110,6 +110,7 @@ def _make_chain(spot: float = 100.0, dte: int = 30) -> list[OptionContract]:
     expiry = date.today() + timedelta(days=dte)
     strikes = [80, 85, 90, 95, 100, 105, 110, 115, 120]
     chain: list[OptionContract] = []
+    quote_ts = datetime.now(timezone.utc).isoformat()
     iv = 0.30
     T = dte / 365.0
     for K in strikes:
@@ -137,6 +138,9 @@ def _make_chain(spot: float = 100.0, dte: int = 30) -> list[OptionContract]:
                 vega=g.vega,
                 underlying_price=spot,
                 source="test",
+                quote_timestamp=quote_ts,
+                quote_age_seconds=0.0,
+                quote_stale=False,
             ))
     return chain
 
@@ -152,6 +156,21 @@ def test_build_long_call_returns_candidate():
     assert c.max_loss == c.debit_credit
     assert c.max_profit == float("inf")
     assert 0.0 < c.pop < 1.0
+    assert c.legs[0].quote_timestamp
+    assert not c.to_dict()["quote_stale"]
+
+
+def test_candidate_dict_flags_stale_option_quote():
+    chain = _make_chain()
+    chain[0].quote_timestamp = ""
+    chain[0].quote_age_seconds = None
+    chain[0].quote_stale = True
+    cands = build_long_call(chain, "TEST", 100.0, target_delta=abs(chain[0].delta), min_dte=20, max_dte=40)
+
+    assert cands
+    stale = [c for c in cands if c.legs[0].quote_stale]
+    assert stale
+    assert stale[0].to_dict()["quote_stale"]
 
 
 def test_build_long_put_returns_candidate():

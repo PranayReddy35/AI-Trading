@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 
-from ai_trading.broker.alpaca_broker import AlpacaBroker, OrderError
+from ai_trading.broker.alpaca_broker import OrderError
+from ai_trading.broker.robinhood_agent import create_broker
 from ai_trading.config import Settings
 from ai_trading.data.market_data import AlpacaMarketData
 from ai_trading.data.cache import BarCache
@@ -32,6 +33,70 @@ LIVE_WARNING = (
 PAPER_NOTICE = (
     "Paper trading mode. No real money at risk."
 )
+
+
+def _record_stock_dry_run(
+    *,
+    settings: Settings,
+    journal: Journal,
+    notifier: Notifier,
+    logger,
+    symbol: str,
+    action: str,
+    qty: int,
+    reason: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    price: float | None = None,
+    broker=None,
+) -> None:
+    dollar_amount = None
+    intent_order_type = order_type
+    intent_limit_price = limit_price
+    if (
+        settings.broker == "robinhood"
+        and settings.robinhood_use_dollar_orders
+        and action.upper() == "BUY"
+    ):
+        dollar_amount = settings.robinhood_dollar_amount_per_trade
+        intent_order_type = "market"
+        intent_limit_price = None
+    record = {
+        "symbol": symbol,
+        "action": action,
+        "qty": qty,
+        "dollar_amount": dollar_amount,
+        "reason": reason,
+        "order_type": intent_order_type,
+        "limit_price": intent_limit_price,
+        "price": price,
+        "mode": "LIVE" if settings.is_live else "PAPER",
+        "dry_run": True,
+    }
+    logger.info(
+        "STOCK DRY RUN: would submit %s %s qty=%s (%s)",
+        action,
+        symbol,
+        qty,
+        reason,
+    )
+    journal.write("stock_dry_run", record)
+    notifier.notify(
+        "trade",
+        f"DRY RUN {'LIVE' if settings.is_live else 'PAPER'} {action} {qty} {symbol}",
+        record,
+    )
+    if settings.broker == "robinhood" and hasattr(broker, "record_order_intent"):
+        broker.record_order_intent(
+            symbol=symbol,
+            side=action,
+            qty=qty,
+            reason=reason,
+            order_type=intent_order_type,
+            limit_price=intent_limit_price,
+            price=price,
+            dollar_amount=dollar_amount,
+        )
 
 
 def _confirm_live_trade(settings: Settings, action: str, symbol: str, qty: int) -> bool:
@@ -66,6 +131,236 @@ def _preflight_checks(settings: Settings, broker: AlpacaBroker, logger) -> bool:
     return True
 
 
+def _latest_price_context(latest_price) -> dict:
+    if latest_price is None:
+        return {
+            "latest_price": None,
+            "latest_time": "",
+            "latest_source": "unavailable",
+            "latest_feed": "",
+            "latest_age_seconds": None,
+            "latest_stale": True,
+            "latest_confidence": "LOW",
+            "latest_confidence_score": 0,
+            "latest_confidence_reason": "latest price unavailable",
+        }
+    feed = str(getattr(latest_price, "feed", "") or "")
+    source = str(getattr(latest_price, "source", "") or "")
+    age = getattr(latest_price, "age_seconds", None)
+    stale = bool(getattr(latest_price, "stale", False))
+    score = 100
+    reasons: list[str] = []
+    feed_l = feed.lower()
+    if feed_l == "sip":
+        reasons.append("SIP")
+    elif feed_l == "iex":
+        score -= 20
+        reasons.append("IEX")
+    elif feed_l in {"delayed_sip", "boats", "overnight"}:
+        score -= 35
+        reasons.append(feed.upper())
+    else:
+        score -= 20
+        reasons.append(feed or "unknown feed")
+    if stale:
+        score -= 30
+        reasons.append("stale")
+    try:
+        age_f = float(age) if age is not None else None
+    except Exception:
+        age_f = None
+    if age_f is not None:
+        if age_f > 900:
+            score -= 30
+            reasons.append(">15m old")
+        elif age_f > 300:
+            score -= 15
+            reasons.append(">5m old")
+        elif age_f <= 60:
+            reasons.append("fresh")
+    score = max(0, min(100, int(score)))
+    confidence = "HIGH" if score >= 80 else "MEDIUM" if score >= 55 else "LOW"
+    return {
+        "latest_price": float(getattr(latest_price, "price", 0.0) or 0.0),
+        "latest_time": str(getattr(latest_price, "timestamp", "") or ""),
+        "latest_source": f"{feed.upper()} {source}".strip(),
+        "latest_feed": feed,
+        "latest_age_seconds": age,
+        "latest_stale": stale,
+        "latest_session": str(getattr(latest_price, "session", "") or ""),
+        "latest_confidence": confidence,
+        "latest_confidence_score": score,
+        "latest_confidence_reason": ", ".join(reasons),
+    }
+
+
+def _freshness_gate(settings: Settings, action: str, latest_price) -> tuple[bool, str]:
+    if not settings.require_fresh_price_for_orders:
+        return True, "freshness gate disabled"
+    if latest_price is None:
+        if action == "SELL" and not settings.stale_price_blocks_sell:
+            return True, "latest price unavailable; allowing SELL"
+        return False, "latest price unavailable"
+
+    ctx = _latest_price_context(latest_price)
+    age = ctx.get("latest_age_seconds")
+    stale = bool(ctx.get("latest_stale"))
+    if age is not None and float(age) > settings.max_latest_price_age_sec:
+        stale = True
+    if stale:
+        if action == "SELL" and not settings.stale_price_blocks_sell:
+            return True, "latest price stale; allowing SELL"
+        return False, f"latest price stale ({age if age is not None else 'unknown'}s old)"
+
+    caution_feeds = {"iex", "delayed_sip", "boats", "overnight"}
+    feed = str(ctx.get("latest_feed") or "").lower()
+    if action == "BUY" and settings.block_caution_feeds_for_buys and feed in caution_feeds:
+        return False, f"caution market data feed for BUY: {feed}"
+
+    return True, "latest price fresh"
+
+
+def _spread_gate(settings: Settings, latest_price) -> tuple[bool, str]:
+    if not settings.use_spread_filter or latest_price is None:
+        return True, "spread gate disabled"
+    bid = getattr(latest_price, "bid", None)
+    ask = getattr(latest_price, "ask", None)
+    try:
+        bid_f = float(bid or 0.0)
+        ask_f = float(ask or 0.0)
+    except Exception:
+        return True, "spread unavailable"
+    if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
+        return True, "spread unavailable"
+    mid = (bid_f + ask_f) / 2.0
+    spread_bps = (ask_f - bid_f) / mid * 1e4 if mid else 0.0
+    if spread_bps > settings.max_spread_bps:
+        return False, f"spread {spread_bps:.1f}bps > {settings.max_spread_bps:.1f}bps"
+    return True, f"spread {spread_bps:.1f}bps OK"
+
+
+def _order_preview_payload(
+    *,
+    settings: Settings,
+    symbol: str,
+    action: str,
+    qty: int,
+    price: float,
+    reason: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    latest_price=None,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "action": action,
+        "qty": int(qty),
+        "price": float(price),
+        "reason": reason,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "mode": "LIVE" if settings.is_live else "PAPER",
+        "dry_run": bool(settings.stock_dry_run),
+        **_latest_price_context(latest_price),
+    }
+
+
+def _record_order_preview(
+    *,
+    settings: Settings,
+    journal: Journal,
+    notifier: Notifier,
+    payload: dict,
+) -> None:
+    journal.write("order_preview", payload)
+    if settings.notify_trade_preview:
+        notifier.notify(
+            "trade",
+            f"PREVIEW {payload['mode']} {payload['action']} {payload['qty']} {payload['symbol']}",
+            payload,
+        )
+
+
+def _prepare_order_attempt(
+    *,
+    settings: Settings,
+    journal: Journal,
+    notifier: Notifier,
+    logger,
+    symbol: str,
+    action: str,
+    qty: int,
+    price: float,
+    reason: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    latest_price=None,
+) -> tuple[bool, dict]:
+    if settings.kill_switch:
+        reject_reason = "BOT_KILL_SWITCH=true"
+        logger.warning("Kill switch blocked %s %s", action, symbol)
+        payload = {
+            "symbol": symbol,
+            "action": action,
+            "reason": reject_reason,
+            **_latest_price_context(latest_price),
+        }
+        journal.write("risk_reject", payload)
+        notifier.notify("risk_reject", f"Kill switch blocked [{symbol}]: {reject_reason}", payload)
+        return False, payload
+
+    fresh_ok, fresh_reason = _freshness_gate(settings, action, latest_price)
+    if not fresh_ok:
+        logger.info("Freshness gate rejected %s %s: %s", action, symbol, fresh_reason)
+        payload = {
+            "symbol": symbol,
+            "action": action,
+            "reason": fresh_reason,
+            **_latest_price_context(latest_price),
+        }
+        journal.write("risk_reject", payload)
+        notifier.notify("risk_reject", f"Freshness gate blocked [{symbol}]: {fresh_reason}", payload)
+        return False, payload
+
+    spread_ok, spread_reason = _spread_gate(settings, latest_price)
+    if not spread_ok:
+        logger.info("Spread gate rejected %s %s: %s", action, symbol, spread_reason)
+        payload = {
+            "symbol": symbol,
+            "action": action,
+            "reason": spread_reason,
+            **_latest_price_context(latest_price),
+        }
+        journal.write("risk_reject", payload)
+        notifier.notify("risk_reject", f"Spread gate blocked [{symbol}]: {spread_reason}", payload)
+        return False, payload
+
+    payload = _order_preview_payload(
+        settings=settings,
+        symbol=symbol,
+        action=action,
+        qty=qty,
+        price=price,
+        reason=f"{reason}; {fresh_reason}; {spread_reason}",
+        order_type=order_type,
+        limit_price=limit_price,
+        latest_price=latest_price,
+    )
+    _record_order_preview(
+        settings=settings,
+        journal=journal,
+        notifier=notifier,
+        payload=payload,
+    )
+
+    if not _confirm_live_trade(settings, action, symbol, qty):
+        logger.info("Order cancelled by user confirmation.")
+        journal.write("user_cancel", {"symbol": symbol, "action": action, "reason": "confirmation denied"})
+        return False, payload
+
+    return True, payload
+
+
 def _maybe_retrain_ml(settings: Settings, symbol: str, logger) -> None:
     """Retrain ML model if it's stale, per ml_retrain_days setting."""
     if settings.ml_retrain_days <= 0:
@@ -96,6 +391,7 @@ def _trade_symbol(
     all_bars: dict,
     now: datetime,
     market_is_open: bool = True,
+    cycle_state: dict | None = None,
 ) -> None:
     """Run one full trade cycle for a single symbol."""
     # Optional cache: skip re-downloading the same bars within TTL
@@ -107,6 +403,36 @@ def _trade_symbol(
         )
     else:
         bars = market_data.get_bars(symbol, settings.lookback_days, settings.bar_timeframe)
+
+    latest_price = None
+    if settings.use_latest_price:
+        try:
+            latest_price = market_data.get_latest_price(symbol)
+            previous_close = float(bars["close"].iloc[-1])
+            bars = market_data.with_latest_price(bars, latest_price)
+            journal.write(
+                "latest_price",
+                {
+                    "symbol": symbol,
+                    "price": latest_price.price,
+                    "source": latest_price.source,
+                    "feed": latest_price.feed,
+                    "bid": latest_price.bid,
+                    "ask": latest_price.ask,
+                    "timestamp": latest_price.timestamp,
+                    "age_seconds": latest_price.age_seconds,
+                    "stale": latest_price.stale,
+                    "session": latest_price.session,
+                    "previous_bar_close": previous_close,
+                    "bar_timeframe": settings.bar_timeframe,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Latest price unavailable for %s; using latest bar close: %s", symbol, exc)
+            journal.write(
+                "latest_price_unavailable",
+                {"symbol": symbol, "reason": str(exc), "bar_timeframe": settings.bar_timeframe},
+            )
     all_bars[symbol] = bars
 
     # Choose signal source: ensemble (with optional MTF confirmation) or legacy MA crossover.
@@ -187,11 +513,38 @@ def _trade_symbol(
             notifier.notify("risk_reject", f"Gap-open block [{symbol}]: {gap_reason}")
             if position_qty > 0:
                 logger.info("Gap-open: closing existing position in %s", symbol)
+                ready, preview_payload = _prepare_order_attempt(
+                    settings=settings,
+                    journal=journal,
+                    notifier=notifier,
+                    logger=logger,
+                    symbol=symbol,
+                    action="SELL",
+                    qty=position_qty,
+                    price=current_price,
+                    reason=f"gap-open protection: {gap_reason}",
+                    latest_price=latest_price,
+                )
+                if not ready:
+                    return
+                if settings.stock_dry_run:
+                    _record_stock_dry_run(
+                        settings=settings,
+                        journal=journal,
+                        notifier=notifier,
+                        logger=logger,
+                        symbol=symbol,
+                        action="SELL",
+                        qty=position_qty,
+                        reason=f"gap-open protection: {gap_reason}",
+                        price=current_price,
+                        broker=broker,
+                    )
+                    return
                 broker.close_position(symbol)
                 risk.clear_trailing_peak(symbol)
-                journal.write("order", {"symbol": symbol, "action": "SELL", "qty": position_qty,
-                                        "reason": "gap-open protection", "mode": "PAPER" if settings.paper_only else "LIVE"})
-                notifier.notify("trade", f"Gap-open SELL {symbol}: {gap_reason}")
+                journal.write("order", {**preview_payload, "reason": "gap-open protection"})
+                notifier.notify("trade", f"Gap-open SELL {symbol}: {gap_reason}", preview_payload)
             return  # skip normal signal logic for this bar
 
     journal.write(
@@ -224,7 +577,37 @@ def _trade_symbol(
                 settings.partial_profit_sell_pct,
             )
             try:
-                broker.submit_order(
+                ready, preview_payload = _prepare_order_attempt(
+                    settings=settings,
+                    journal=journal,
+                    notifier=notifier,
+                    logger=logger,
+                    symbol=symbol,
+                    action="SELL",
+                    qty=sell_qty,
+                    price=signal.close,
+                    reason="partial profit",
+                    latest_price=latest_price,
+                )
+                if not ready:
+                    return
+                if settings.stock_dry_run:
+                    _record_stock_dry_run(
+                        settings=settings,
+                        journal=journal,
+                        notifier=notifier,
+                        logger=logger,
+                        symbol=symbol,
+                        action="SELL",
+                        qty=sell_qty,
+                        reason="partial profit",
+                        price=signal.close,
+                        broker=broker,
+                    )
+                    entry_price = float(pos_detail.get("avg_entry_price", 0))
+                    risk.mark_partial_profit_taken(symbol, entry_price=entry_price)
+                    return
+                order = broker.submit_order(
                     symbol, "SELL", sell_qty,
                     order_type="market",
                     max_retries=settings.max_api_retries,
@@ -232,6 +615,8 @@ def _trade_symbol(
                 entry_price = float(pos_detail.get("avg_entry_price", 0))
                 risk.mark_partial_profit_taken(symbol, entry_price=entry_price)
                 journal.write("partial_profit", {
+                    **preview_payload,
+                    "order_id": str(getattr(order, "id", "")),
                     "symbol": symbol,
                     "unrealized_plpc": pos_detail["unrealized_plpc"],
                     "sold_qty": sell_qty,
@@ -243,6 +628,7 @@ def _trade_symbol(
                     "trade",
                     f"💰 Partial profit SELL {sell_qty} {symbol} "
                     f"(+{pos_detail['unrealized_plpc']*100:.1f}% gain) — holding {position_qty - sell_qty} shares",
+                    preview_payload,
                 )
             except Exception as exc:
                 logger.warning("Partial profit sell failed for %s: %s", symbol, exc)
@@ -256,7 +642,37 @@ def _trade_symbol(
         if should_exit:
             logger.info("Partial remainder exit for %s: %s", symbol, exit_reason)
             try:
-                broker.submit_order(
+                ready, preview_payload = _prepare_order_attempt(
+                    settings=settings,
+                    journal=journal,
+                    notifier=notifier,
+                    logger=logger,
+                    symbol=symbol,
+                    action="SELL",
+                    qty=position_qty,
+                    price=signal.close,
+                    reason=f"partial remainder exit: {exit_reason}",
+                    latest_price=latest_price,
+                )
+                if not ready:
+                    return
+                if settings.stock_dry_run:
+                    _record_stock_dry_run(
+                        settings=settings,
+                        journal=journal,
+                        notifier=notifier,
+                        logger=logger,
+                        symbol=symbol,
+                        action="SELL",
+                        qty=position_qty,
+                        reason=f"partial remainder exit: {exit_reason}",
+                        price=signal.close,
+                        broker=broker,
+                    )
+                    risk.clear_partial_profit(symbol)
+                    risk.clear_trailing_peak(symbol)
+                    return
+                order = broker.submit_order(
                     symbol, "SELL", position_qty,
                     order_type="market",
                     max_retries=settings.max_api_retries,
@@ -264,9 +680,15 @@ def _trade_symbol(
                 risk.clear_partial_profit(symbol)
                 risk.clear_trailing_peak(symbol)
                 journal.write("partial_remainder_exit", {
+                    **preview_payload,
+                    "order_id": str(getattr(order, "id", "")),
                     "symbol": symbol, "qty": position_qty, "reason": exit_reason,
                 })
-                notifier.notify("trade", f"Partial remainder SELL {position_qty} {symbol}: {exit_reason}")
+                notifier.notify(
+                    "trade",
+                    f"Partial remainder SELL {position_qty} {symbol}: {exit_reason}",
+                    preview_payload,
+                )
             except Exception as exc:
                 logger.warning("Partial remainder exit failed for %s: %s", symbol, exc)
             return
@@ -292,6 +714,18 @@ def _trade_symbol(
     else:
         effective_signal = _apply_sentiment(signal.signal, symbol, settings, journal, logger)
 
+    if position_qty > 0 and settings.max_symbol_loss_pct > 0:
+        pos_detail = broker.position_details(symbol)
+        loss_pct = None
+        if pos_detail and pos_detail.get("unrealized_plpc") is not None:
+            loss_pct = float(pos_detail["unrealized_plpc"]) * 100.0
+        if loss_pct is not None and loss_pct <= -settings.max_symbol_loss_pct:
+            effective_signal = "SELL"
+            reason = f"symbol loss {loss_pct:.2f}% <= -{settings.max_symbol_loss_pct:.2f}%"
+            logger.warning("Symbol loss stop triggered for %s: %s", symbol, reason)
+            journal.write("symbol_loss_stop_triggered", {"symbol": symbol, "reason": reason})
+            notifier.notify("risk_reject", f"Symbol loss stop [{symbol}]: {reason}")
+
     action = "HOLD"
     requested_qty = settings.max_shares
     if effective_signal == "BUY" and position_qty == 0:
@@ -299,7 +733,25 @@ def _trade_symbol(
             logger.info("Market closed — skipping BUY %s", symbol)
             journal.write("market_closed_skip", {"symbol": symbol, "signal": "BUY"})
             return
+        if settings.max_buys_per_cycle > 0 and cycle_state is not None:
+            buys_so_far = int(cycle_state.get("buys", 0) or 0)
+            if buys_so_far >= settings.max_buys_per_cycle:
+                reason = f"max buys per cycle reached ({buys_so_far}/{settings.max_buys_per_cycle})"
+                logger.info("Cycle buy cap blocked BUY %s: %s", symbol, reason)
+                journal.write("risk_reject", {"symbol": symbol, "action": "BUY", "reason": reason})
+                return
         action = "BUY"
+
+        if settings.block_buy_gap_up_pct > 0 and len(bars) >= 2:
+            prior_close = float(bars["close"].iloc[-2])
+            current_price = float(signal.close)
+            if prior_close > 0 and current_price > prior_close:
+                gap_up_pct = (current_price - prior_close) / prior_close * 100.0
+                if gap_up_pct >= settings.block_buy_gap_up_pct:
+                    reason = f"gap-up chase block {gap_up_pct:.2f}% >= {settings.block_buy_gap_up_pct:.2f}%"
+                    logger.info("Gap-up chase block for BUY %s: %s", symbol, reason)
+                    journal.write("gap_chase_reject", {"symbol": symbol, "reason": reason})
+                    return
 
         # ── Macro filters (free; yfinance) ────────────────────────────────
         if settings.use_spy_trend_filter:
@@ -442,6 +894,23 @@ def _trade_symbol(
         if settings.use_meta_label and settings.meta_size_scale:
             requested_qty = max(1, int(requested_qty * meta_prob)) if requested_qty > 0 else 0
 
+        if (
+            requested_qty <= 0
+            and settings.broker == "robinhood"
+            and settings.robinhood_use_dollar_orders
+            and settings.robinhood_dollar_amount_per_trade > 0
+        ):
+            requested_qty = 1
+            journal.write(
+                "robinhood_fractional_sizing",
+                {
+                    "symbol": symbol,
+                    "dollar_amount": settings.robinhood_dollar_amount_per_trade,
+                    "nominal_qty": requested_qty,
+                    "reason": "fractional dollar-order mode",
+                },
+            )
+
         # Portfolio heat cap: total $-at-risk across open positions
         if settings.use_atr_stops and settings.max_portfolio_heat_pct > 0:
             from ai_trading.risk.portfolio_sizing import portfolio_heat_check
@@ -486,6 +955,44 @@ def _trade_symbol(
         risk.clear_error_streak()
         return
 
+    if action == "BUY":
+        available_cash = max(
+            0.0,
+            min(
+                float(account.get("cash", 0.0) or 0.0),
+                float(account.get("buying_power", account.get("cash", 0.0)) or 0.0),
+            ),
+        )
+        if settings.broker == "robinhood" and settings.robinhood_use_dollar_orders:
+            estimated_notional = settings.robinhood_dollar_amount_per_trade
+        else:
+            estimated_notional = float(signal.close) * int(requested_qty)
+        cash_buffer = max(1.0, settings.min_cash_threshold)
+        if requested_qty <= 0:
+            reason = "position sizing produced zero shares"
+            logger.info("Affordability gate blocked BUY %s: %s", symbol, reason)
+            journal.write("risk_reject", {"symbol": symbol, "action": action, "reason": reason})
+            return
+        if estimated_notional + cash_buffer > available_cash:
+            reason = (
+                f"estimated notional ${estimated_notional:.2f} + buffer ${cash_buffer:.2f} "
+                f"> available cash ${available_cash:.2f}"
+            )
+            logger.info("Affordability gate blocked BUY %s: %s", symbol, reason)
+            journal.write("risk_reject", {"symbol": symbol, "action": action, "reason": reason})
+            return
+
+    if settings.kill_switch:
+        reason = "BOT_KILL_SWITCH=true"
+        logger.warning("Kill switch blocked %s %s", action, symbol)
+        journal.write("risk_reject", {"symbol": symbol, "action": action, "reason": reason})
+        notifier.notify(
+            "risk_reject",
+            f"Kill switch blocked [{symbol}]: {reason}",
+            {"symbol": symbol, "action": action, "reason": reason},
+        )
+        return
+
     decision = risk.evaluate(
         today=now.date(),
         paper_mode=broker.paper,
@@ -513,11 +1020,6 @@ def _trade_symbol(
         if drawdown >= settings.portfolio_drawdown_halt_pct * 0.75:  # warn at 75% of limit
             notifier.send_drawdown_alert(drawdown, equity, risk._peak_equity)
 
-    if not _confirm_live_trade(settings, action, symbol, decision.approved_qty):
-        logger.info("Order cancelled by user confirmation.")
-        journal.write("user_cancel", {"symbol": symbol, "action": action, "reason": "confirmation denied"})
-        return
-
     limit_price = None
     if settings.order_type == "limit":
         offset_mult = 1 + (settings.limit_price_offset_pct / 100.0)
@@ -525,6 +1027,43 @@ def _trade_symbol(
             limit_price = signal.close * offset_mult
         else:
             limit_price = signal.close * (1 - settings.limit_price_offset_pct / 100.0)
+
+    ready, preview_payload = _prepare_order_attempt(
+        settings=settings,
+        journal=journal,
+        notifier=notifier,
+        logger=logger,
+        symbol=symbol,
+        action=action,
+        qty=decision.approved_qty,
+        price=signal.close,
+        reason="risk-approved signal",
+        order_type=settings.order_type,
+        limit_price=limit_price,
+        latest_price=latest_price,
+    )
+    if not ready:
+        return
+
+    if settings.stock_dry_run:
+        _record_stock_dry_run(
+            settings=settings,
+            journal=journal,
+            notifier=notifier,
+            logger=logger,
+            symbol=symbol,
+            action=action,
+            qty=decision.approved_qty,
+            reason="risk-approved signal",
+            order_type=settings.order_type,
+            limit_price=limit_price,
+            price=signal.close,
+            broker=broker,
+        )
+        if action == "BUY" and cycle_state is not None:
+            cycle_state["buys"] = int(cycle_state.get("buys", 0) or 0) + 1
+        risk.clear_error_streak()
+        return
 
     order = broker.submit_order(
         symbol,
@@ -537,6 +1076,8 @@ def _trade_symbol(
 
     risk.register_trade(now.date())
     risk.clear_error_streak()
+    if action == "BUY" and cycle_state is not None:
+        cycle_state["buys"] = int(cycle_state.get("buys", 0) or 0) + 1
 
     # Update trailing peak on BUY
     if action == "BUY":
@@ -546,6 +1087,7 @@ def _trade_symbol(
         risk.clear_partial_profit(symbol)
 
     order_record = {
+        **preview_payload,
         "symbol": symbol,
         "action": action,
         "qty": decision.approved_qty,
@@ -702,6 +1244,7 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
     settings = Settings.from_env()
     if symbol_override:
         settings.symbol = symbol_override.upper()
+        settings.symbols = settings.symbol
     if skip_confirmation:
         settings.require_confirmation = False
     settings.validate()
@@ -719,11 +1262,15 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         journal.write("mode", {"mode": "LIVE", "warning": LIVE_WARNING})
     else:
         logger.info(PAPER_NOTICE)
+    if settings.stock_dry_run:
+        logger.info("Stock dry-run mode is enabled. Stock orders will be logged, not submitted.")
+        journal.write("mode", {"stock_dry_run": True})
 
-    broker = AlpacaBroker(settings.api_key, settings.api_secret, paper=settings.paper_only)
+    broker = create_broker(settings)
     market_data = AlpacaMarketData(
         settings.api_key, settings.api_secret,
         cache_ttl_sec=settings.data_cache_ttl_sec,
+        data_feed=settings.market_data_feed,
     )
 
     risk = RiskManager(
@@ -795,6 +1342,19 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
                 for pos in broker.all_positions():
                     sym = pos["symbol"]
                     try:
+                        if settings.stock_dry_run:
+                            _record_stock_dry_run(
+                                settings=settings,
+                                journal=journal,
+                                notifier=notifier,
+                                logger=logger,
+                                symbol=sym,
+                                action="SELL",
+                                qty=pos["qty"],
+                                reason=f"EOD close ({mins_left:.1f} min to close)",
+                                broker=broker,
+                            )
+                            continue
                         broker.close_position(sym)
                         risk.clear_trailing_peak(sym)
                         journal.write("order", {"symbol": sym, "action": "SELL",
@@ -812,6 +1372,7 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
 
         # Fetch bars for all symbols (used by correlation filter too)
         all_bars: dict = {}
+        cycle_state: dict = {"buys": 0}
 
         for symbol in symbols:
             try:
@@ -828,6 +1389,7 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
                     all_bars=all_bars,
                     now=now,
                     market_is_open=market_is_open,
+                    cycle_state=cycle_state,
                 )
             except OrderError as exc:
                 risk.register_error()

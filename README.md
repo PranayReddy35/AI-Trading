@@ -729,9 +729,28 @@ The dashboard can be deployed for free on [Streamlit Community Cloud](https://sh
 ```toml
 APCA_API_KEY_ID = "YOUR_API_KEY"
 APCA_API_SECRET_KEY = "YOUR_API_SECRET"
-BOT_PAPER_ONLY = "true"
-BOT_WEBHOOK_URL = "YOUR_WEBHOOK_URL"
+BOT_BROKER = "robinhood"
+BOT_PAPER_ONLY = "false"
+BOT_STOCK_DRY_RUN = "true"
+BOT_SHOW_ALPACA_PAPER = "false"
+BOT_NOTIFY_EVENTS = "trade,error,risk_reject,daily_summary,drawdown,scanner_summary"
+
+BOT_WEBHOOK_URL = ""
+BOT_BUY_WEBHOOK_URL = "YOUR_BUY_CHANNEL_WEBHOOK_URL"
+BOT_SELL_WEBHOOK_URL = "YOUR_SELL_CHANNEL_WEBHOOK_URL"
+BOT_OTHER_WEBHOOK_URL = "YOUR_OTHER_ALERTS_WEBHOOK_URL"
+
+ROBINHOOD_AGENTIC_ENABLED = "true"
+ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "YOUR_AGENTIC_ACCOUNT_NUMBER"
+ROBINHOOD_USE_DOLLAR_ORDERS = "true"
+ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE = "25"
+ROBINHOOD_ORDER_INTENTS_PATH = "logs/robinhood_order_intents.jsonl"
+ROBINHOOD_QUOTES_PATH = "logs/robinhood_quotes.json"
+ROBINHOOD_PORTFOLIOS_PATH = "logs/robinhood_portfolios.json"
+ROBINHOOD_SNAPSHOT_TTL_SEC = "300"
 ```
+
+See `.streamlit/secrets.example.toml` for a longer copy/paste template.
 
 5. Click **Deploy**. You'll get a public URL like `https://your-app.streamlit.app`.
 

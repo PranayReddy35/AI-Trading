@@ -5,6 +5,16 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ai_trading.time_utils import app_timezone, local_iso_now
+
+
+class LocalTimezoneFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=app_timezone())
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec="seconds")
+
 
 def configure_logging(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -12,7 +22,7 @@ def configure_logging(log_path: Path) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    formatter = LocalTimezoneFormatter("%(asctime)s %(levelname)s %(message)s")
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
@@ -32,7 +42,7 @@ class Journal:
 
     def write(self, event_type: str, payload: dict) -> None:
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": local_iso_now(),
             "event_type": event_type,
             "payload": payload,
         }

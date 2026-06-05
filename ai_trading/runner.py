@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from ai_trading.bot import run_once
+from ai_trading.time_utils import format_local, format_local_now
 
 
 _shutdown_requested = False
@@ -27,12 +28,31 @@ def seconds_until(hour: int, minute: int) -> float:
     return (target - now).total_seconds()
 
 
+def _format_utc_schedule(hour: int, minute: int) -> str:
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return f"{format_local(target, '%I:%M %p %Z')} ({hour:02d}:{minute:02d} UTC)"
+
+
 def _health_check() -> bool:
-    """Basic health check: verify we can import and configure."""
+    """Verify config and Alpaca account connectivity without placing trades."""
     try:
         from ai_trading.config import Settings
+        from ai_trading.broker.robinhood_agent import create_broker
+
         settings = Settings.from_env()
         settings.validate()
+        broker = create_broker(settings)
+        account = broker.account_state()
+        mode = "PAPER" if settings.paper_only else "LIVE"
+        dry_run = "on" if settings.stock_dry_run else "off"
+        print(
+            "Health check passed: "
+            f"broker={settings.broker}, mode={mode}, stock_dry_run={dry_run}, "
+            f"account_status={account['status']}, "
+            f"buying_power=${account['buying_power']:,.2f}, "
+            f"equity=${account['equity']:,.2f}"
+        )
         return True
     except Exception as exc:
         print(f"Health check failed: {exc}", file=sys.stderr)
@@ -68,11 +88,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.health_check:
-        if _health_check():
-            print("Health check passed.")
-            sys.exit(0)
-        else:
-            sys.exit(1)
+        sys.exit(0 if _health_check() else 1)
 
     # Register graceful shutdown handlers
     signal.signal(signal.SIGINT, _signal_handler)
@@ -100,9 +116,9 @@ def main() -> None:
         except (ValueError, IndexError):
             parser.error(f"Invalid --daily-summary '{args.daily_summary}'. Expected HH:MM")
 
-    print(f"Runner started. Scheduled daily at {hour:02d}:{minute:02d} UTC.")
+    print(f"Runner started. Scheduled daily at {_format_utc_schedule(hour, minute)}.")
     if summary_hour is not None:
-        print(f"Daily summary at {summary_hour:02d}:{summary_minute:02d} UTC.")
+        print(f"Daily summary at {_format_utc_schedule(summary_hour, summary_minute)}.")
     print("Press Ctrl+C for graceful shutdown.")
 
     last_summary_date = None
@@ -140,7 +156,7 @@ def main() -> None:
         if _shutdown_requested:
             break
 
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Starting scheduled run...")
+        print(f"[{format_local_now()}] Starting scheduled run...")
         try:
             run_once(symbol_override=args.symbol, skip_confirmation=args.no_confirm)
         except Exception as exc:

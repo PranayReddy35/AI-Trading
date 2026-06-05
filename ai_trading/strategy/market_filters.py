@@ -12,6 +12,8 @@ Filters:
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -107,6 +109,26 @@ def vix_size_multiplier(
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_EARNINGS_SKIP_SYMBOLS = frozenset({
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "VT", "VEA", "VWO",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLU", "XLRE",
+    "GLD", "SLV", "USO", "UNG", "TLT", "IEF", "SHY", "HYG", "LQD", "EEM",
+    "ARKK", "ARKG", "ARKW", "XBI", "SMH", "SOXX", "KRE", "XRT",
+    "XLB", "IGV", "KWEB", "FXI", "IYR", "EWZ", "EFA", "IJH", "RSP", "SCHD",
+    "VXX", "UVXY", "SVXY", "SQQQ", "TQQQ", "SPXL", "SPXS",
+    "SOXL", "SOXS", "TNA", "TZA", "LABU", "LABD", "FAS", "FAZ",
+    "BOIL", "KOLD", "NUGT", "DUST", "BITO", "IBIT", "FBTC", "ETHA",
+    "TSLL", "TSLG", "TSDD", "GGLS", "AAPD", "AMZD", "PLTD", "DRAM",
+    "IUSB", "USHY", "QID", "RWM", "SPDN",
+})
+
+
+def _earnings_skip_symbols() -> set[str]:
+    raw = os.getenv("BOT_EARNINGS_SKIP_SYMBOLS", "")
+    extra = {s.strip().upper() for s in raw.split(",") if s.strip()}
+    return set(_DEFAULT_EARNINGS_SKIP_SYMBOLS) | extra
+
+
 @dataclass(slots=True)
 class EarningsCheck:
     blocked: bool
@@ -118,6 +140,8 @@ class EarningsCheck:
 @lru_cache(maxsize=256)
 def _next_earnings_date(symbol: str) -> date | None:
     """Look up the next earnings date via yfinance. None if unknown."""
+    if symbol.strip().upper() in _earnings_skip_symbols():
+        return None
     try:
         import yfinance as yf
         tk = yf.Ticker(symbol)
@@ -148,6 +172,8 @@ def in_earnings_blackout(symbol: str, blackout_days: int = 2, today: date | None
     """Block opening new positions within `blackout_days` of an earnings release."""
     if blackout_days <= 0:
         return EarningsCheck(False, None, None, "blackout disabled")
+    if symbol.strip().upper() in _earnings_skip_symbols():
+        return EarningsCheck(False, None, None, "earnings lookup skipped for fund/ETF symbol; allow")
     today = today or datetime.now().date()
     ed = _next_earnings_date(symbol)
     if ed is None:
@@ -159,6 +185,48 @@ def in_earnings_blackout(symbol: str, blackout_days: int = 2, today: date | None
             f"earnings in {delta}d ({ed.isoformat()}) within {blackout_days}d blackout",
         )
     return EarningsCheck(False, ed, delta, f"earnings {ed.isoformat()} ({delta}d away)")
+
+
+def earnings_blackout_map(
+    symbols: list[str] | tuple[str, ...],
+    blackout_days: int = 2,
+    today: date | None = None,
+    *,
+    max_workers: int = 8,
+) -> dict[str, EarningsCheck]:
+    """Return earnings blackout checks for symbols with bounded parallel yfinance calls.
+
+    yfinance exposes earnings calendars per ticker, not as a true batch endpoint. This
+    wrapper limits concurrency and reuses _next_earnings_date's process cache.
+    """
+    clean = tuple(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
+    if not clean:
+        return {}
+    if blackout_days <= 0:
+        return {
+            sym: EarningsCheck(False, None, None, "blackout disabled")
+            for sym in clean
+        }
+    today = today or datetime.now().date()
+    workers = max(1, min(int(max_workers or 1), len(clean)))
+    if workers == 1:
+        return {
+            sym: in_earnings_blackout(sym, blackout_days=blackout_days, today=today)
+            for sym in clean
+        }
+    out: dict[str, EarningsCheck] = {}
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="earnings-gate") as ex:
+        futures = {
+            ex.submit(in_earnings_blackout, sym, blackout_days, today): sym
+            for sym in clean
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                out[sym] = fut.result()
+            except Exception:
+                out[sym] = EarningsCheck(False, None, None, "earnings lookup failed; allow")
+    return out
 
 
 # ---------------------------------------------------------------------------

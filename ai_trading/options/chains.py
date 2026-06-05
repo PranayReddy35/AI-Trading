@@ -5,6 +5,7 @@ Returns a normalized `OptionContract` per row with:
 - bid, ask, mid, last, volume, open_interest
 - iv, delta, theta, gamma, vega (computed via BS if not provided by feed)
 - underlying_price (spot at time of fetch)
+- quote/trade timestamps and quote staleness metadata
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
@@ -48,6 +49,11 @@ class OptionContract:
     vega: float
     underlying_price: float
     source: str        # 'alpaca' | 'yfinance'
+    quote_timestamp: str = ""
+    trade_timestamp: str = ""
+    quote_age_seconds: float | None = None
+    trade_age_seconds: float | None = None
+    quote_stale: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -75,6 +81,53 @@ def _mid(bid: float, ask: float) -> float:
     if bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     return ask or bid or 0.0
+
+
+def _timestamp_iso(ts: object | None) -> str:
+    if ts is None:
+        return ""
+    if hasattr(ts, "isoformat"):
+        return ts.isoformat()
+    raw = str(ts).strip()
+    return raw
+
+
+def _timestamp_epoch(ts: object | None) -> float | None:
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, datetime):
+            dt = ts
+        else:
+            raw = str(ts).strip()
+            if not raw:
+                return None
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _age_seconds(ts: object | None, *, now: datetime | None = None) -> float | None:
+    epoch = _timestamp_epoch(ts)
+    if epoch is None:
+        return None
+    now_epoch = (now or datetime.now(timezone.utc)).timestamp()
+    return max(0.0, now_epoch - epoch)
+
+
+def _stale_threshold_sec() -> int:
+    try:
+        return max(1, int(os.getenv("BOT_OPTIONS_QUOTE_STALE_SEC", "120") or 120))
+    except ValueError:
+        return 120
+
+
+def _quote_stale(quote_ts: object | None, *, now: datetime | None = None) -> bool:
+    age = _age_seconds(quote_ts, now=now)
+    return age is None or age > _stale_threshold_sec()
 
 
 def _years(dte: int) -> float:
@@ -176,6 +229,7 @@ def _fetch_chain_alpaca(
 
     out: list[OptionContract] = []
     today = date.today()
+    now = datetime.now(timezone.utc)
     for occ, s in snap.items():
         parsed = parse_occ(occ)
         if not parsed:
@@ -190,6 +244,8 @@ def _fetch_chain_alpaca(
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0) if quote else 0.0
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0) if quote else 0.0
         last = float(getattr(trade, "price", 0.0) or 0.0) if trade else 0.0
+        quote_ts = getattr(quote, "timestamp", None) if quote else None
+        trade_ts = getattr(trade, "timestamp", None) if trade else None
         d = {
             "occ_symbol": occ,
             "underlying": parsed["underlying"],
@@ -210,6 +266,11 @@ def _fetch_chain_alpaca(
             "vega":  float(getattr(greeks, "vega",  0.0) or 0.0) if greeks else 0.0,
             "underlying_price": spot,
             "source": "alpaca",
+            "quote_timestamp": _timestamp_iso(quote_ts),
+            "trade_timestamp": _timestamp_iso(trade_ts),
+            "quote_age_seconds": _age_seconds(quote_ts, now=now),
+            "trade_age_seconds": _age_seconds(trade_ts, now=now),
+            "quote_stale": _quote_stale(quote_ts, now=now),
         }
         d = _ensure_greeks(d, spot, risk_free)
         out.append(OptionContract(**d))
@@ -255,6 +316,7 @@ def _fetch_chain_yfinance(
 
     out: list[OptionContract] = []
     today = date.today()
+    fetch_ts = datetime.now(timezone.utc)
     for e in expiries:
         try:
             chain = t.option_chain(e.strftime("%Y-%m-%d"))
@@ -284,6 +346,7 @@ def _fetch_chain_yfinance(
                 vol = int(row.get("volume", 0) or 0)
                 oi = int(row.get("openInterest", 0) or 0)
                 occ = str(row.get("contractSymbol", ""))
+                last_trade_ts = row.get("lastTradeDate", None)
                 dte = (e - today).days
                 d = {
                     "occ_symbol": occ,
@@ -301,6 +364,11 @@ def _fetch_chain_yfinance(
                     "iv": iv,
                     "underlying_price": spot,
                     "source": "yfinance",
+                    "quote_timestamp": "",
+                    "trade_timestamp": _timestamp_iso(last_trade_ts),
+                    "quote_age_seconds": None,
+                    "trade_age_seconds": _age_seconds(last_trade_ts, now=fetch_ts),
+                    "quote_stale": True,
                 }
                 d = _ensure_greeks(d, spot, risk_free)
                 out.append(OptionContract(**d))
@@ -365,7 +433,18 @@ def get_quote(occ_symbol: str, source: str = "auto") -> dict:
             q = res[occ_symbol] if isinstance(res, dict) else res
             bid = float(getattr(q, "bid_price", 0) or 0)
             ask = float(getattr(q, "ask_price", 0) or 0)
-            return {"occ_symbol": occ_symbol, "bid": bid, "ask": ask, "mid": _mid(bid, ask), "source": "alpaca"}
+            quote_ts = getattr(q, "timestamp", None)
+            now = datetime.now(timezone.utc)
+            return {
+                "occ_symbol": occ_symbol,
+                "bid": bid,
+                "ask": ask,
+                "mid": _mid(bid, ask),
+                "source": "alpaca",
+                "quote_timestamp": _timestamp_iso(quote_ts),
+                "quote_age_seconds": _age_seconds(quote_ts, now=now),
+                "quote_stale": _quote_stale(quote_ts, now=now),
+            }
         except Exception as exc:
             if source == "alpaca":
                 raise
@@ -374,8 +453,26 @@ def get_quote(occ_symbol: str, source: str = "auto") -> dict:
     chain = _fetch_chain_yfinance(parsed["underlying"], expiry=parsed["expiry"])
     for c in chain:
         if c.occ_symbol == occ_symbol or (c.type == parsed["type"] and abs(c.strike - parsed["strike"]) < 1e-6):
-            return {"occ_symbol": occ_symbol, "bid": c.bid, "ask": c.ask, "mid": c.mid, "source": "yfinance"}
-    return {"occ_symbol": occ_symbol, "bid": 0.0, "ask": 0.0, "mid": 0.0, "source": "none"}
+            return {
+                "occ_symbol": occ_symbol,
+                "bid": c.bid,
+                "ask": c.ask,
+                "mid": c.mid,
+                "source": "yfinance",
+                "quote_timestamp": c.quote_timestamp,
+                "quote_age_seconds": c.quote_age_seconds,
+                "quote_stale": c.quote_stale,
+            }
+    return {
+        "occ_symbol": occ_symbol,
+        "bid": 0.0,
+        "ask": 0.0,
+        "mid": 0.0,
+        "source": "none",
+        "quote_timestamp": "",
+        "quote_age_seconds": None,
+        "quote_stale": True,
+    }
 
 
 def list_expirations(

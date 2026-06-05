@@ -253,7 +253,7 @@ def mean_reversion_signal(bars: pd.DataFrame) -> StrategySignal:
 
     # Position within bands (0 = lower, 1 = upper)
     band_width = upper - lower
-    if band_width <= 0:
+    if not np.isfinite(band_width) or band_width <= 0:
         return StrategySignal("mean_reversion", 0.0, 0.1, "zero band width")
 
     bb_position = (current - lower) / band_width
@@ -295,9 +295,14 @@ def momentum_signal(bars: pd.DataFrame) -> StrategySignal:
     if len(close) < 20:
         return StrategySignal("momentum", 0.0, 0.0, "insufficient data")
 
-    # Rate of change (10-day)
-    roc_10 = float((close.iloc[-1] / close.iloc[-10] - 1) * 100)
-    roc_5 = float((close.iloc[-1] / close.iloc[-5] - 1) * 100)
+    # Rate of change (10-day) — guard against NaN/zero in historical closes
+    _c0 = float(close.iloc[-1])
+    _c10 = float(close.iloc[-10])
+    _c5 = float(close.iloc[-5])
+    if not (np.isfinite(_c0) and np.isfinite(_c10) and _c10 != 0 and np.isfinite(_c5) and _c5 != 0):
+        return StrategySignal("momentum", 0.0, 0.0, "NaN in price data")
+    roc_10 = (_c0 / _c10 - 1) * 100
+    roc_5 = (_c0 / _c5 - 1) * 100
 
     # Volume confirmation
     vol_avg = float(volume.iloc[-20:].mean())
@@ -380,16 +385,17 @@ def compute_ensemble_signal(
     regime_state = detect_regime(bars)
     regime = regime_state.regime
 
-    # Get individual strategy signals
+    # Get individual strategy signals.
     # Imported here to avoid a circular import (patterns imports StrategySignal from this module).
     from ai_trading.strategy.patterns import pattern_signal
 
-    signals: list[StrategySignal] = [
-        trend_following_signal(bars),
-        mean_reversion_signal(bars),
-        momentum_signal(bars),
-        pattern_signal(bars),
+    _strategy_funcs = [
+        ("trend", trend_following_signal),
+        ("mean_reversion", mean_reversion_signal),
+        ("momentum", momentum_signal),
+        ("patterns", pattern_signal),
     ]
+    signals: list[StrategySignal] = []
     for name, func in _strategy_funcs:
         try:
             signals.append(func(bars))

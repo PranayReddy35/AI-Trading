@@ -16,7 +16,8 @@ Supported:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from typing import Iterable, Literal
 
 from ai_trading.options.chains import OptionContract
@@ -40,6 +41,11 @@ class StrategyLeg:
     mid: float = 0.0
     bid: float = 0.0
     ask: float = 0.0
+    source: str = ""
+    quote_timestamp: str = ""
+    trade_timestamp: str = ""
+    quote_age_seconds: float | None = None
+    quote_stale: bool = False
 
 
 @dataclass(slots=True)
@@ -64,6 +70,16 @@ class StrategyCandidate:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["legs"] = [asdict(leg) for leg in self.legs]
+        quote_ages = [
+            float(leg.quote_age_seconds)
+            for leg in self.legs
+            if leg.quote_age_seconds is not None
+        ]
+        stale_legs = [leg for leg in self.legs if leg.quote_stale or not leg.quote_timestamp]
+        d["quote_age_seconds"] = max(quote_ages) if quote_ages else None
+        d["quote_stale"] = bool(stale_legs)
+        d["quote_timestamp"] = _oldest_quote_timestamp(self.legs)
+        d["quote_source"] = ",".join(sorted({leg.source for leg in self.legs if leg.source})) or ""
         return d
 
 
@@ -114,6 +130,29 @@ def _liquidity_ok(c: OptionContract) -> bool:
     return c.bid > 0 and c.ask > 0 and (c.ask - c.bid) / max(c.mid, 0.01) <= 1.0
 
 
+def _timestamp_epoch(ts: str) -> float | None:
+    try:
+        if not ts:
+            return None
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _oldest_quote_timestamp(legs: list[StrategyLeg]) -> str:
+    known = [
+        (epoch, leg.quote_timestamp)
+        for leg in legs
+        if (epoch := _timestamp_epoch(leg.quote_timestamp)) is not None
+    ]
+    if not known:
+        return ""
+    return min(known, key=lambda item: item[0])[1]
+
+
 def _leg(c: OptionContract, side: Side, ratio: int = 1) -> StrategyLeg:
     return StrategyLeg(
         occ_symbol=c.occ_symbol,
@@ -125,6 +164,11 @@ def _leg(c: OptionContract, side: Side, ratio: int = 1) -> StrategyLeg:
         mid=c.mid,
         bid=c.bid,
         ask=c.ask,
+        source=c.source,
+        quote_timestamp=c.quote_timestamp,
+        trade_timestamp=c.trade_timestamp,
+        quote_age_seconds=c.quote_age_seconds,
+        quote_stale=c.quote_stale,
     )
 
 

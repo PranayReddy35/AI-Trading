@@ -60,14 +60,18 @@ def _swing_high_low(close: pd.Series, lookback: int = 60) -> tuple[float, float,
     Falls back to argmax/argmin within the window if no prominent swings are found.
     """
     window = close.iloc[-lookback:].reset_index(drop=True)
-    swings = detect_swings(window, prominence_pct=0.02)
+    # Drop NaN so argmax/argmin and scipy peak-finding work correctly.
+    clean = window.dropna()
+    if clean.empty:
+        return float("nan"), float("nan"), 0, 0
+    swings = detect_swings(clean, prominence_pct=0.02)
     if len(swings.high_idx) > 0 and len(swings.low_idx) > 0:
         hi_idx = int(swings.high_idx[-1])
         lo_idx = int(swings.low_idx[-1])
-    else:
-        hi_idx = int(window.values.argmax())
-        lo_idx = int(window.values.argmin())
-    return float(window.iloc[hi_idx]), float(window.iloc[lo_idx]), hi_idx, lo_idx
+        return float(clean.iloc[hi_idx]), float(clean.iloc[lo_idx]), hi_idx, lo_idx
+    hi_idx = int(clean.values.argmax())
+    lo_idx = int(clean.values.argmin())
+    return float(clean.iloc[hi_idx]), float(clean.iloc[lo_idx]), hi_idx, lo_idx
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +98,7 @@ def fibonacci_retracement(bars: pd.DataFrame, lookback: int = 60, tol: float = 0
 
     swing_hi, swing_lo, hi_idx, lo_idx = _swing_high_low(close, lookback)
     rng = swing_hi - swing_lo
-    if rng <= 0:
+    if not np.isfinite(rng) or rng <= 0:
         return PatternHit("fibonacci", 0.0, 0.0, "flat range")
 
     price = float(close.iloc[-1])
@@ -844,15 +848,26 @@ def pattern_signal(bars: pd.DataFrame) -> StrategySignal:
     if not hits:
         return StrategySignal("patterns", 0.0, 0.0, "no detectors")
 
-    weighted_sum = sum(h.signal * h.confidence for h in hits)
-    weight_total = sum(h.confidence for h in hits)
+    valid_hits = [
+        h for h in hits
+        if np.isfinite(h.signal) and np.isfinite(h.confidence)
+    ]
+    if not valid_hits:
+        return StrategySignal("patterns", 0.0, 0.0, "no valid pattern hits")
+
+    weighted_sum = sum(h.signal * h.confidence for h in valid_hits)
+    weight_total = sum(h.confidence for h in valid_hits)
     combined = weighted_sum / weight_total if weight_total > 0 else 0.0
 
-    agree = sum(1 for h in hits if (h.signal > 0.1 and combined > 0) or (h.signal < -0.1 and combined < 0))
-    confidence = min(1.0, 0.25 * agree + 0.1)  # 1 agree → 0.35, 3 → 0.85
+    agree = sum(
+        1
+        for h in valid_hits
+        if (h.signal > 0.1 and combined > 0) or (h.signal < -0.1 and combined < 0)
+    )
+    confidence = min(1.0, 0.25 * agree + 0.1)  # 1 agree -> 0.35, 3 -> 0.85
 
-    # Build a compact reason string from the strongest hits
-    strong = sorted(hits, key=lambda h: abs(h.signal) * h.confidence, reverse=True)[:3]
+    # Build a compact reason string from the strongest valid hits.
+    strong = sorted(valid_hits, key=lambda h: abs(h.signal) * h.confidence, reverse=True)[:3]
     reason = "; ".join(f"{h.name}:{h.reason}" for h in strong if abs(h.signal) > 0.05) or "no strong pattern"
 
     return StrategySignal("patterns", float(np.clip(combined, -1.0, 1.0)), confidence, reason)

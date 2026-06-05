@@ -4,11 +4,21 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ai_trading.env import load_dotenv
+
 
 @dataclass(slots=True)
 class Settings:
     api_key: str
     api_secret: str
+    broker: str = "alpaca"
+    robinhood_agentic_enabled: bool = False
+    robinhood_agentic_account_number: str = ""
+    robinhood_agentic_buying_power: float = 0.0
+    robinhood_agentic_equity: float = 0.0
+    robinhood_order_intents_path: str = "logs/robinhood_order_intents.jsonl"
+    robinhood_use_dollar_orders: bool = False
+    robinhood_dollar_amount_per_trade: float = 0.0
     symbol: str = "SPY"
     fast_ma: int = 5
     slow_ma: int = 20
@@ -38,6 +48,26 @@ class Settings:
     max_api_retries: int = 3
     # Seconds to wait for order fill before timeout (0 = no wait)
     order_fill_timeout_sec: int = 60
+    # Dry-run stock orders: log intended stock trades without submitting them.
+    stock_dry_run: bool = False
+    # Global safety stop: when true, no new stock orders are submitted.
+    kill_switch: bool = False
+    # Send a Discord/journal preview before submitting stock orders.
+    notify_trade_preview: bool = True
+    # Require latest-price metadata before submitting stock orders.
+    require_fresh_price_for_orders: bool = True
+    # Max allowed latest-price age for order decisions.
+    max_latest_price_age_sec: int = 300
+    # Block SELL orders too when latest price is stale; default keeps exits possible.
+    stale_price_blocks_sell: bool = False
+    # Block BUY orders when latest stock price comes from fallback/caution feeds.
+    block_caution_feeds_for_buys: bool = False
+    # Max BUY submissions in one bot run/cycle (0 = disabled).
+    max_buys_per_cycle: int = 0
+    # Force an exit when an open symbol loss reaches this % (0 = disabled).
+    max_symbol_loss_pct: float = 0.0
+    # Block new BUYs after a gap-up larger than this % from prior bar close (0 = disabled).
+    block_buy_gap_up_pct: float = 0.0
     # Webhook URL for notifications (empty = disabled)
     webhook_url: str = ""
     # Notify on: trade, error, risk_reject, daily_summary
@@ -164,6 +194,10 @@ class Settings:
     # --- Data caching ---
     # Cache TTL in seconds for market data (0 = no caching)
     data_cache_ttl_sec: int = 300
+    # Pull latest IEX quote/trade and patch the final bar before signal/sizing.
+    use_latest_price: bool = True
+    # Stock data feed: auto, sip, delayed_sip, iex, boats, overnight, otc.
+    market_data_feed: str = "auto"
 
     # --- Sentiment caching ---
     # Cache TTL in seconds for sentiment data (0 = no caching)
@@ -248,12 +282,24 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        load_dotenv()
         api_key = os.getenv("APCA_API_KEY_ID", "")
         api_secret = os.getenv("APCA_API_SECRET_KEY", "")
         notify_events_raw = os.getenv("BOT_NOTIFY_EVENTS", "trade,error")
         return cls(
             api_key=api_key,
             api_secret=api_secret,
+            broker=os.getenv("BOT_BROKER", "alpaca").strip().lower() or "alpaca",
+            robinhood_agentic_enabled=os.getenv("ROBINHOOD_AGENTIC_ENABLED", "false").lower() == "true",
+            robinhood_agentic_account_number=os.getenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "").strip(),
+            robinhood_agentic_buying_power=float(os.getenv("ROBINHOOD_AGENTIC_BUYING_POWER", "0")),
+            robinhood_agentic_equity=float(os.getenv("ROBINHOOD_AGENTIC_EQUITY", "0")),
+            robinhood_order_intents_path=os.getenv(
+                "ROBINHOOD_ORDER_INTENTS_PATH",
+                "logs/robinhood_order_intents.jsonl",
+            ),
+            robinhood_use_dollar_orders=os.getenv("ROBINHOOD_USE_DOLLAR_ORDERS", "false").lower() == "true",
+            robinhood_dollar_amount_per_trade=max(0.0, float(os.getenv("ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE", "0"))),
             symbol=os.getenv("BOT_SYMBOL", "SPY").upper(),
             fast_ma=int(os.getenv("BOT_FAST_MA", "5")),
             slow_ma=int(os.getenv("BOT_SLOW_MA", "20")),
@@ -273,6 +319,16 @@ class Settings:
             require_confirmation=os.getenv("BOT_REQUIRE_CONFIRMATION", "true").lower() == "true",
             max_api_retries=max(1, int(os.getenv("BOT_MAX_API_RETRIES", "3"))),
             order_fill_timeout_sec=max(0, int(os.getenv("BOT_ORDER_FILL_TIMEOUT_SEC", "60"))),
+            stock_dry_run=os.getenv("BOT_STOCK_DRY_RUN", "false").lower() == "true",
+            kill_switch=os.getenv("BOT_KILL_SWITCH", "false").lower() == "true",
+            notify_trade_preview=os.getenv("BOT_NOTIFY_TRADE_PREVIEW", "true").lower() == "true",
+            require_fresh_price_for_orders=os.getenv("BOT_REQUIRE_FRESH_PRICE_FOR_ORDERS", "true").lower() == "true",
+            max_latest_price_age_sec=max(1, int(os.getenv("BOT_MAX_LATEST_PRICE_AGE_SEC", "300"))),
+            stale_price_blocks_sell=os.getenv("BOT_STALE_PRICE_BLOCKS_SELL", "false").lower() == "true",
+            block_caution_feeds_for_buys=os.getenv("BOT_BLOCK_CAUTION_FEEDS_FOR_BUYS", "false").lower() == "true",
+            max_buys_per_cycle=max(0, int(os.getenv("BOT_MAX_BUYS_PER_CYCLE", "0"))),
+            max_symbol_loss_pct=max(0.0, float(os.getenv("BOT_MAX_SYMBOL_LOSS_PCT", "0"))),
+            block_buy_gap_up_pct=max(0.0, float(os.getenv("BOT_BLOCK_BUY_GAP_UP_PCT", "0"))),
             webhook_url=os.getenv("BOT_WEBHOOK_URL", ""),
             notify_events=[e.strip() for e in notify_events_raw.split(",") if e.strip()],
             trade_cooldown_sec=max(0, int(os.getenv("BOT_TRADE_COOLDOWN_SEC", "0"))),
@@ -302,6 +358,9 @@ class Settings:
             correlation_filter_threshold=float(os.getenv("BOT_CORRELATION_FILTER_THRESHOLD", "0")),
             ml_retrain_days=max(0, int(os.getenv("BOT_ML_RETRAIN_DAYS", "0"))),
             ml_model_path=os.getenv("BOT_ML_MODEL_PATH", "models/ensemble.joblib"),
+            data_cache_ttl_sec=max(0, int(os.getenv("BOT_DATA_CACHE_TTL_SEC", "300"))),
+            use_latest_price=os.getenv("BOT_USE_LATEST_PRICE", "true").lower() == "true",
+            market_data_feed=os.getenv("BOT_MARKET_DATA_FEED", "auto").lower(),
             daily_summary_time=os.getenv("BOT_DAILY_SUMMARY_TIME", ""),
             close_before_eod=max(0, int(os.getenv("BOT_CLOSE_BEFORE_EOD", "0"))),
             gap_open_protection_pct=float(os.getenv("BOT_GAP_OPEN_PROTECTION_PCT", "0")),
@@ -313,6 +372,8 @@ class Settings:
             dip_require_uptrend=os.getenv("BOT_DIP_REQUIRE_UPTREND", "true").lower() == "true",
             partial_profit_trigger_pct=float(os.getenv("BOT_PARTIAL_PROFIT_TRIGGER_PCT", "0")),
             partial_profit_sell_pct=max(1.0, min(99.0, float(os.getenv("BOT_PARTIAL_PROFIT_SELL_PCT", "50")))),
+            partial_profit_max_hold_bars=max(0, int(os.getenv("BOT_PARTIAL_PROFIT_MAX_HOLD_BARS", "0"))),
+            partial_profit_trailing_stop_pct=max(0.0, float(os.getenv("BOT_PARTIAL_PROFIT_TRAILING_STOP_PCT", "0"))),
             use_atr_stops=os.getenv("BOT_USE_ATR_STOPS", "false").lower() == "true",
             atr_stop_mult=float(os.getenv("BOT_ATR_STOP_MULT", "2.0")),
             atr_period=max(2, int(os.getenv("BOT_ATR_PERIOD", "14"))),
@@ -372,7 +433,29 @@ class Settings:
 
     def validate(self) -> None:
         if not self.api_key or not self.api_secret:
-            raise ValueError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY.")
+            raise ValueError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY for market data.")
+        if self.broker not in ("alpaca", "robinhood"):
+            raise ValueError("BOT_BROKER must be 'alpaca' or 'robinhood'.")
+        if self.broker == "robinhood":
+            if not self.robinhood_agentic_enabled:
+                raise ValueError("ROBINHOOD_AGENTIC_ENABLED must be true for BOT_BROKER=robinhood.")
+            if not self.robinhood_agentic_account_number:
+                raise ValueError("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is required for BOT_BROKER=robinhood.")
+            if self.robinhood_agentic_buying_power <= 0 or self.robinhood_agentic_equity <= 0:
+                raise ValueError(
+                    "Set ROBINHOOD_AGENTIC_BUYING_POWER and ROBINHOOD_AGENTIC_EQUITY "
+                    "from a fresh Robinhood portfolio check before BOT_BROKER=robinhood."
+                )
+            if not self.stock_dry_run:
+                raise ValueError(
+                    "BOT_STOCK_DRY_RUN must be true for BOT_BROKER=robinhood until "
+                    "a local Robinhood MCP execution client is implemented."
+                )
+            if self.robinhood_use_dollar_orders:
+                if self.robinhood_dollar_amount_per_trade <= 0:
+                    raise ValueError("ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE must be > 0 when dollar orders are enabled.")
+                if self.order_type != "market":
+                    raise ValueError("Robinhood dollar/fractional orders require BOT_ORDER_TYPE=market.")
         if self.fast_ma <= 0 or self.slow_ma <= 0 or self.fast_ma >= self.slow_ma:
             raise ValueError("Require 0 < fast_ma < slow_ma.")
         if self.order_type not in ("market", "limit"):

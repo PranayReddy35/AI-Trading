@@ -37,6 +37,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import yfinance as yf
 
+from ai_trading.env import load_dotenv
+from ai_trading.time_utils import format_local_now
+
+
+load_dotenv()
+
 
 # ── Scoring weights (EOD mode) ────────────────────────────────────────────────
 W_MA        = 0.20
@@ -59,6 +65,13 @@ LW_DIP       = 0.07   # intraday dip (below VWAP + RSI oversold)
 LW_RS        = 0.10   # daily-bars relative strength vs SPY
 LW_META      = 0.05   # meta-label P(win) from daily-bars model
 
+# ── Scan performance knobs ───────────────────────────────────────────────────
+_YF_BATCH_SIZE = max(50, int(os.getenv("BOT_SCAN_YF_BATCH_SIZE", "200") or 200))
+_YF_MAX_WORKERS = max(2, int(os.getenv("BOT_SCAN_YF_MAX_WORKERS", "12") or 12))
+_SCAN_FETCH_CACHE_TTL_SEC = max(0, int(os.getenv("BOT_SCAN_FETCH_CACHE_TTL_SEC", "90") or 90))
+_SCAN_FETCH_CACHE: dict[tuple, tuple[float, object]] = {}
+_EOD_DATA_SOURCE = str(os.getenv("BOT_SCAN_EOD_SOURCE", "auto") or "auto").strip().lower()
+
 
 @dataclass
 class ScanResult:
@@ -76,7 +89,8 @@ class ScanResult:
     upside_pct: float = 0.0   # estimated short-term upside % (score-derived)
     top_driver: str = ""      # single strongest bullish factor label
     mode: str = "live"        # "live" or "eod"
-    as_of: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%H:%M:%S UTC"))
+    data_source: str = ""     # primary bar source (alpaca/yfinance)
+    as_of: str = field(default_factory=lambda: format_local_now("%I:%M:%S %p %Z"))
     # ── enhancements ─────────────────────────────────────────────────────────
     rel_strength_pct: float = 0.0      # outperformance vs SPY over lookback (%)
     bb_squeeze: float = 0.0            # 0..1 — higher = tighter Bollinger compression
@@ -436,6 +450,9 @@ def _quality_gates(
     earnings_blackout_days: int = 2,
     check_volume: bool = True,
     volume_min_ratio: float = 0.8,
+    spy_trend_result: tuple[bool, str] | None = None,
+    vix_result: tuple[float, str] | None = None,
+    earnings_result=None,
 ) -> tuple[bool, str]:
     """Apply the same macro/quality filters the bot uses. Returns (pass, flags_str)."""
     flags: list[str] = []
@@ -446,19 +463,19 @@ def _quality_gates(
         return True, "filters unavailable"
 
     if check_spy_trend:
-        ok, _ = mf.spy_trend_ok()
+        ok, _ = spy_trend_result if spy_trend_result is not None else mf.spy_trend_ok()
         if not ok:
             flags.append("spy_trend")
             passed = False
     if check_vix:
-        mult, _ = mf.vix_size_multiplier()
+        mult, _ = vix_result if vix_result is not None else mf.vix_size_multiplier()
         if mult <= 0:
             flags.append("vix_panic")
             passed = False
         elif mult < 0.5:
             flags.append(f"vix×{mult:.1f}")
     if check_earnings and earnings_blackout_days > 0:
-        ec = mf.in_earnings_blackout(symbol, blackout_days=earnings_blackout_days)
+        ec = earnings_result if earnings_result is not None else mf.in_earnings_blackout(symbol, blackout_days=earnings_blackout_days)
         if ec.blocked:
             flags.append("earnings")
             passed = False
@@ -468,6 +485,43 @@ def _quality_gates(
             flags.append("low_vol")
             passed = False
     return passed, ",".join(flags) if flags else "ok"
+
+
+def _quality_gate_context(
+    candidate_symbols: list[str],
+    *,
+    check_spy_trend: bool = True,
+    check_vix: bool = True,
+    check_earnings: bool = True,
+    earnings_blackout_days: int = 2,
+) -> dict[str, object]:
+    """Precompute scan-wide quality data so candidate rendering avoids repeat calls."""
+    try:
+        from ai_trading.strategy import market_filters as mf
+    except Exception:
+        return {"spy": None, "vix": None, "earnings": {}}
+
+    ctx: dict[str, object] = {"spy": None, "vix": None, "earnings": {}}
+    if check_spy_trend:
+        try:
+            ctx["spy"] = mf.spy_trend_ok()
+        except Exception:
+            ctx["spy"] = (True, "SPY lookup failed; allow")
+    if check_vix:
+        try:
+            ctx["vix"] = mf.vix_size_multiplier()
+        except Exception:
+            ctx["vix"] = (1.0, "VIX lookup failed; full size")
+    if check_earnings and earnings_blackout_days > 0:
+        try:
+            ctx["earnings"] = mf.earnings_blackout_map(
+                tuple(candidate_symbols),
+                blackout_days=earnings_blackout_days,
+                max_workers=max(1, min(8, _YF_MAX_WORKERS)),
+            )
+        except Exception:
+            ctx["earnings"] = {}
+    return ctx
 
 
 def _diversify(
@@ -552,8 +606,8 @@ def _parallel_yf_download(
     symbols: list[str],
     *,
     period: str,
-    batch_size: int = 100,
-    max_workers: int = 4,
+    batch_size: int = _YF_BATCH_SIZE,
+    max_workers: int = _YF_MAX_WORKERS,
 ) -> pd.DataFrame:
     """Download many tickers in parallel chunks. Concatenates results."""
     if not symbols:
@@ -567,6 +621,90 @@ def _parallel_yf_download(
             if df is not None and not df.empty:
                 frames.append(df)
     return pd.concat(frames, axis=1) if frames else pd.DataFrame()
+
+
+def _scan_cache_get(key: tuple):
+    if _SCAN_FETCH_CACHE_TTL_SEC <= 0:
+        return None
+    entry = _SCAN_FETCH_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, payload = entry
+    if _time.time() - ts > _SCAN_FETCH_CACHE_TTL_SEC:
+        _SCAN_FETCH_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _scan_cache_set(key: tuple, payload: object) -> None:
+    if _SCAN_FETCH_CACHE_TTL_SEC <= 0:
+        return
+    _SCAN_FETCH_CACHE[key] = (_time.time(), payload)
+
+
+def _norm_ohlcv(bars: pd.DataFrame) -> pd.DataFrame:
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    b = bars.copy()
+    b.columns = [str(c).lower() for c in b.columns]
+    if "close" in b.columns:
+        b = b.dropna(subset=["close"])
+    return b.sort_index()
+
+
+def _fetch_eod_bars(
+    symbols: list[str],
+    *,
+    lookback_days: int,
+) -> tuple[dict[str, pd.DataFrame], str]:
+    """Fetch daily bars for many symbols, preferring Alpaca batched requests.
+
+    Returns ({SYMBOL: bars}, source_label).
+    """
+    clean = [s.strip().upper() for s in symbols if s and s.strip()]
+    if not clean:
+        return {}, "none"
+
+    cache_key = ("eod_bars", tuple(clean), int(lookback_days), _EOD_DATA_SOURCE)
+    cached = _scan_cache_get(cache_key)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        bars_map, source = cached
+        if isinstance(bars_map, dict):
+            return bars_map, str(source)
+
+    source_pref = _EOD_DATA_SOURCE if _EOD_DATA_SOURCE in {"auto", "alpaca", "yfinance"} else "auto"
+    if source_pref in {"auto", "alpaca"}:
+        api_key = os.getenv("APCA_API_KEY_ID", "")
+        api_secret = os.getenv("APCA_API_SECRET_KEY", "")
+        if api_key and api_secret:
+            try:
+                from ai_trading.data.market_data import AlpacaMarketData
+
+                data_feed = str(os.getenv("BOT_SCAN_EOD_FEED", "iex") or "iex")
+                md = AlpacaMarketData(api_key, api_secret, cache_ttl_sec=60, data_feed=data_feed)
+                bars_map: dict[str, pd.DataFrame] = {}
+                for i in range(0, len(clean), _ALPACA_BATCH_SIZE):
+                    chunk = clean[i:i + _ALPACA_BATCH_SIZE]
+                    chunk_bars = md.get_multi_symbol_bars(chunk, lookback_days=lookback_days, timeframe="1Day")
+                    for sym, bars in chunk_bars.items():
+                        norm = _norm_ohlcv(bars)
+                        if not norm.empty:
+                            bars_map[sym.upper()] = norm
+                if bars_map:
+                    _scan_cache_set(cache_key, (bars_map, "alpaca"))
+                    return bars_map, "alpaca"
+            except Exception as exc:
+                if source_pref == "alpaca":
+                    print(f"Alpaca EOD fetch failed; falling back to yfinance: {exc}")
+
+    period = f"{max(lookback_days, 120)}d"
+    raw = _parallel_yf_download(clean, period=period)
+    if raw.empty:
+        return {}, "yfinance"
+    bars_map = {sym: _extract_per_symbol(raw, sym, len(clean)) for sym in clean}
+    bars_map = {sym: b for sym, b in bars_map.items() if b is not None and not b.empty}
+    _scan_cache_set(cache_key, (bars_map, "yfinance"))
+    return bars_map, "yfinance"
 
 
 def _extract_per_symbol(raw: pd.DataFrame, sym: str, n_symbols: int) -> pd.DataFrame:
@@ -608,18 +746,17 @@ def scan(
     RS vs SPY, Bollinger squeeze, meta-label P(win), ATR levels, quality gates,
     correlation dedup.
     """
+    symbols = [s.strip().upper() for s in symbols if s and s.strip()]
     if not symbols:
         return []
 
     # Ensure SPY is fetched once for relative-strength baseline
     fetch_symbols = list(dict.fromkeys(symbols + ["SPY"]))
-    period = f"{max(lookback_days, 120)}d"   # enough history for BB squeeze + 50-MA + RS
-    raw = _parallel_yf_download(fetch_symbols, period=period)
-
-    if raw.empty:
+    bars_map, _bars_source = _fetch_eod_bars(fetch_symbols, lookback_days=max(lookback_days, 120))
+    if not bars_map:
         return []
 
-    spy_bars = _extract_per_symbol(raw, "SPY", len(fetch_symbols))
+    spy_bars = bars_map.get("SPY", pd.DataFrame())
     spy_close = spy_bars["close"].astype(float) if not spy_bars.empty else pd.Series(dtype=float)
 
     rows: list[dict] = []
@@ -627,7 +764,7 @@ def scan(
 
     for sym in symbols:
         try:
-            bars = _extract_per_symbol(raw, sym, len(fetch_symbols))
+            bars = bars_map.get(sym, pd.DataFrame())
             if bars.empty or len(bars) < slow_ma + 5:
                 continue
 
@@ -643,11 +780,6 @@ def scan(
                 continue
             factors["symbol"] = sym
             factors["avg_dollar_vol_m"] = round(adv / 1e6, 2)
-            factors["rs_pct"] = _rel_strength_pct(
-                bars["close"].astype(float), spy_close, lookback=20,
-            ) if not spy_close.empty else 0.0
-            factors["squeeze"] = _bb_squeeze_score(bars["close"].astype(float))
-            factors["meta_prob"] = _meta_probability(bars) if use_meta else None
             rows.append(factors)
             bars_by_symbol[sym] = bars
         except Exception:
@@ -665,33 +797,60 @@ def scan(
     df["n_volume"]   = _normalise(df["volume_surge"])          # higher vol surge = conviction
     df["n_trend"]    = _normalise(df["trend_consistency"])     # more up-days = better
     df["n_dip"]      = _normalise(df["dip_score"])             # higher dip score = better setup
-    df["n_rs"]       = _normalise(df["rs_pct"])                # outperforming SPY = alpha
-    df["n_squeeze"]  = _normalise(df["squeeze"])               # tighter squeeze = breakout setup
-
-    # Meta-label: use raw probability (0..1) directly when present, else neutral 0.5
-    if "meta_prob" in df.columns:
-        df["n_meta"] = pd.to_numeric(df["meta_prob"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
-    else:
-        df["n_meta"] = 0.5
-
-    df["score"] = (
+    # Defer heavy enrichment (RS, squeeze, meta) to the top candidates only.
+    df["base_score"] = (
         df["n_ma"]       * W_MA       +
         df["n_momentum"] * W_MOMENTUM +
         df["n_rsi"]      * W_RSI      +
         df["n_volume"]   * W_VOLUME   +
         df["n_trend"]    * W_TREND    +
-        df["n_dip"]      * W_DIP      +
-        df["n_rs"]       * W_RS       +
-        df["n_squeeze"]  * W_SQUEEZE  +
-        df["n_meta"]     * W_META
+        df["n_dip"]      * W_DIP
     ) * 100
-    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
+    df["base_score"] = pd.to_numeric(df["base_score"], errors="coerce").fillna(0.0)
 
+    df["rs_pct"] = 0.0
+    df["squeeze"] = 0.0
+    df["meta_prob"] = pd.NA
+    candidate_n = min(len(df), max(top_n * 5, 30))
+    candidate_syms = df["base_score"].sort_values(ascending=False).head(candidate_n).index.tolist()
+    for sym in candidate_syms:
+        bars = bars_by_symbol.get(sym)
+        if bars is None or bars.empty:
+            continue
+        close = bars["close"].astype(float)
+        df.at[sym, "rs_pct"] = _rel_strength_pct(close, spy_close, lookback=20) if not spy_close.empty else 0.0
+        df.at[sym, "squeeze"] = _bb_squeeze_score(close)
+        if use_meta:
+            mp = _meta_probability(bars)
+            if mp is not None:
+                df.at[sym, "meta_prob"] = mp
+
+    df["n_rs"] = _normalise(df["rs_pct"])
+    df["n_squeeze"] = _normalise(df["squeeze"])
+    df["n_meta"] = pd.to_numeric(df["meta_prob"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
+    df["score"] = (
+        df["base_score"] +
+        (df["n_rs"] * W_RS + df["n_squeeze"] * W_SQUEEZE + df["n_meta"] * W_META) * 100
+    )
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
     df = df.sort_values("score", ascending=False)
 
     results: list[ScanResult] = []
     # Take 3× top_n initially so dedup has room to filter
     initial_n = top_n * 3 if dedup else top_n
+    candidate_symbols = [str(sym) for sym in df.head(initial_n).index]
+    check_earnings = len(symbols) < 1000
+    quality_ctx = (
+        _quality_gate_context(
+            candidate_symbols,
+            check_earnings=check_earnings,
+            earnings_blackout_days=earnings_blackout_days,
+        )
+        if apply_filters else {"spy": None, "vix": None, "earnings": {}}
+    )
+    quality_earnings = quality_ctx.get("earnings", {})
+    if not isinstance(quality_earnings, dict):
+        quality_earnings = {}
     for sym, row in df.head(initial_n).iterrows():
         score = _sf(row.get("score"))
         rsi = _sf(row.get("rsi"))
@@ -733,7 +892,11 @@ def scan(
         if apply_filters:
             qpass, qflags = _quality_gates(
                 sym, bars_by_symbol[sym],
+                check_earnings=check_earnings,
                 earnings_blackout_days=earnings_blackout_days,
+                spy_trend_result=quality_ctx.get("spy"),
+                vix_result=quality_ctx.get("vix"),
+                earnings_result=quality_earnings.get(str(sym)),
             )
 
         results.append(ScanResult(
@@ -751,6 +914,7 @@ def scan(
             upside_pct=upside,
             top_driver=top_driver,
             mode="eod",
+            data_source=_bars_source,
             rel_strength_pct=rs_pct,
             bb_squeeze=squeeze,
             meta_prob=meta_prob,
@@ -884,8 +1048,7 @@ def scan_live(
     start = end - timedelta(minutes=max(lookback_minutes, 60))
 
     # Alpaca GET requests have a URL length limit (~8KB), so batch symbols.
-    _BATCH = 200
-    chunks = [symbols[i:i + _BATCH] for i in range(0, len(symbols), _BATCH)]
+    chunks = [symbols[i:i + _ALPACA_BATCH_SIZE] for i in range(0, len(symbols), _ALPACA_BATCH_SIZE)]
     frames: list[pd.DataFrame] = []
     for chunk in chunks:
         request = StockBarsRequest(
@@ -961,13 +1124,13 @@ def scan_live(
     # liquidity, RS-vs-SPY, BB squeeze, meta-prob, ATR levels.
     candidate_n = max(top_n * 5, 30)
     candidates = df["score_intraday"].sort_values(ascending=False).head(candidate_n).index.tolist()
-    daily_raw = _parallel_yf_download(list(dict.fromkeys(candidates + ["SPY"])), period="120d")
-    spy_daily = _extract_per_symbol(daily_raw, "SPY", len(candidates) + 1)
+    daily_bars_map, _enrich_source = _fetch_eod_bars(list(dict.fromkeys(candidates + ["SPY"])), lookback_days=120)
+    spy_daily = daily_bars_map.get("SPY", pd.DataFrame())
     spy_close = spy_daily["close"].astype(float) if not spy_daily.empty else pd.Series(dtype=float)
 
     daily_bars_by_symbol: dict[str, pd.DataFrame] = {}
     for sym in candidates:
-        b = _extract_per_symbol(daily_raw, sym, len(candidates) + 1)
+        b = daily_bars_map.get(sym, pd.DataFrame())
         if not b.empty:
             daily_bars_by_symbol[sym] = b
 
@@ -1015,6 +1178,19 @@ def scan_live(
 
     results: list[ScanResult] = []
     initial_n = top_n * 3 if dedup else top_n
+    candidate_symbols = [str(sym) for sym in df.head(initial_n).index]
+    check_earnings = len(symbols) < 1000
+    quality_ctx = (
+        _quality_gate_context(
+            candidate_symbols,
+            check_earnings=check_earnings,
+            earnings_blackout_days=earnings_blackout_days,
+        )
+        if apply_filters else {"spy": None, "vix": None, "earnings": {}}
+    )
+    quality_earnings = quality_ctx.get("earnings", {})
+    if not isinstance(quality_earnings, dict):
+        quality_earnings = {}
     for sym, row in df.head(initial_n).iterrows():
         score = _sf(row.get("score"))
         rsi = _sf(row.get("rsi"))
@@ -1054,7 +1230,11 @@ def scan_live(
         if apply_filters:
             qpass, qflags = _quality_gates(
                 sym, daily_b if not daily_b.empty else pd.DataFrame(),
+                check_earnings=check_earnings,
                 earnings_blackout_days=earnings_blackout_days,
+                spy_trend_result=quality_ctx.get("spy"),
+                vix_result=quality_ctx.get("vix"),
+                earnings_result=quality_earnings.get(str(sym)),
             )
 
         results.append(ScanResult(
@@ -1072,6 +1252,7 @@ def scan_live(
             upside_pct=upside,
             top_driver=top_driver,
             mode="live",
+            data_source="alpaca",
             rel_strength_pct=rs_pct,
             bb_squeeze=squeeze,
             meta_prob=meta_prob,
@@ -1120,7 +1301,10 @@ def main() -> None:
     parser.add_argument("--slow-ma", type=int, default=20)
     parser.add_argument(
         "--mode", choices=["auto", "live", "eod"], default="auto",
-        help="auto=live if market open else eod, live=Alpaca intraday, eod=yfinance daily",
+        help=(
+            "auto=live if market open else eod. Live uses Alpaca IEX intraday bars; "
+            "EOD uses yfinance/Alpaca daily bars. Robinhood is used later for execution quotes."
+        ),
     )
     parser.add_argument("--min-price", type=float, default=5.0, help="Liquidity gate: min last close")
     parser.add_argument("--min-dollar-vol", type=float, default=5_000_000.0,
@@ -1151,7 +1335,11 @@ def main() -> None:
         print(f"Universe expanded: +{len(idx_syms)} symbols → {len(symbols)} total")
 
     use_live = args.mode == "live" or (args.mode == "auto" and is_market_open())
-    mode_label = "LIVE (Alpaca IEX 5-min)" if use_live else "EOD (yfinance daily)"
+    effective_use_live = use_live
+    broker = os.getenv("BOT_BROKER", "alpaca").strip().lower() or "alpaca"
+    mode_label = "LIVE (Alpaca IEX 5-min)" if use_live else "EOD (historical daily bars)"
+    if broker == "robinhood":
+        mode_label += "; execution quotes: Robinhood"
 
     print(f"Scanning {len(symbols)} symbols — mode: {mode_label}")
 
@@ -1170,6 +1358,7 @@ def main() -> None:
             results = scan_live(symbols, top_n=args.top, **common_kwargs)
         except Exception as exc:
             print(f"Live scan failed ({exc}), falling back to EOD...")
+            effective_use_live = False
             results = scan(symbols, fast_ma=args.fast_ma, slow_ma=args.slow_ma,
                            top_n=args.top, **common_kwargs)
     else:
@@ -1183,11 +1372,19 @@ def main() -> None:
         print("No results. Market may be closed, no data available, or all picks filtered out.")
         return
 
+    if results:
+        sources = sorted({r.data_source for r in results if r.data_source})
+        source_label = ", ".join(sources) if sources else "unknown"
+        scan_kind = "LIVE" if effective_use_live else "EOD"
+        mode_label = f"{scan_kind} scan data: {source_label}"
+        if broker == "robinhood":
+            mode_label += "; execution quotes: Robinhood"
+
     print(f"\n{'='*120}")
-    print(f"  TOP {args.top} BUY OPPORTUNITIES  —  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  [{mode_label}]")
+    print(f"  TOP {args.top} BUY OPPORTUNITIES  —  {format_local_now('%Y-%m-%d %I:%M %p %Z')}  [{mode_label}]")
     print(f"{'='*120}")
-    label_5d = "Intra%" if use_live else "5D%"
-    label_vwap = "VWAP%" if use_live else "MA%"
+    label_5d = "Intra%" if effective_use_live else "5D%"
+    label_vwap = "VWAP%" if effective_use_live else "MA%"
     print(
         f"{'#':<3} {'Sym':<6} {'Score':>6} {'Sig':<6} {'Price':>8} {'1D%':>6} {label_5d:>7} "
         f"{'RSI':>5} {'VolX':>5} {label_vwap:>7} {'RS%':>6} {'Sqz':>5} {'Meta':>5} "
@@ -1209,4 +1406,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
