@@ -12,6 +12,7 @@ import pickle
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -493,6 +494,60 @@ st.sidebar.markdown("---")
 
 # ── Scanner controls ──────────────────────────────────────────────────────────
 _default_universe_idx = 3 if _env_symbols else 0
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _latest_trade_prices(symbols: tuple[str, ...]) -> dict[str, float]:
+    """Fetch latest trade prices from Alpaca for a symbol batch."""
+    if not symbols:
+        return {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        client = StockHistoricalDataClient(
+            os.environ["APCA_API_KEY_ID"],
+            os.environ["APCA_API_SECRET_KEY"],
+        )
+        req = StockLatestTradeRequest(symbol_or_symbols=list(symbols))
+        trades = client.get_stock_latest_trade(req)
+        out: dict[str, float] = {}
+        if isinstance(trades, dict):
+            for sym, trade in trades.items():
+                try:
+                    px = float(getattr(trade, "price", 0.0) or 0.0)
+                    if px > 0:
+                        out[str(sym)] = px
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return {}
+
+
+def _overlay_latest_prices(results: list) -> list:
+    """Overwrite scanner close with latest trade prices when available."""
+    if not results:
+        return results
+    symbols = tuple(dict.fromkeys(r.symbol for r in results if getattr(r, "symbol", "")))
+    if not symbols:
+        return results
+    latest = _latest_trade_prices(symbols)
+    if not latest:
+        return results
+    updated: list = []
+    for r in results:
+        px = latest.get(getattr(r, "symbol", ""))
+        if px:
+            try:
+                updated.append(replace(r, close=px))
+                continue
+            except Exception:
+                pass
+        updated.append(r)
+    return updated
+
+# ── Universe selector ─────────────────────────────────────────────────────────
 _universe_mode = st.sidebar.radio(
     "Universe",
     ["📋 Curated (~130)", "📈 Indexes", "🌐 Full Market (~12K)", "✍️ Custom / .env"],
@@ -4108,6 +4163,7 @@ elif active_key == "advisor":
                                 scan_out = scan([adv_symbol], fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=1)
                         else:
                             scan_out = scan([adv_symbol], fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=1)
+                        scan_out = _overlay_latest_prices(scan_out)
                     except Exception as exc:
                         scan_out = []
                         st.error(f"Could not fetch market data: {exc}")
@@ -4255,6 +4311,7 @@ elif active_key == "advisor":
                                     scan_out = scan(syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(syms))
                             else:
                                 scan_out = scan(syms, fast_ma=int(scanner_fast_ma), slow_ma=int(scanner_slow_ma), top_n=len(syms))
+                            scan_out = _overlay_latest_prices(scan_out)
                         except Exception as exc:
                             scan_out = []
                             st.error(f"Scan failed: {exc}")
