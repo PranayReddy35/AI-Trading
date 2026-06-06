@@ -309,6 +309,30 @@ View recent dashboard approvals:
 tail -n 20 logs/robinhood_approvals.jsonl
 ```
 
+List pending Robinhood approvals:
+
+```bash
+python -m ai_trading.broker.robinhood_executor list
+```
+
+Print the next approval's Robinhood Agentic review/place payload:
+
+```bash
+python -m ai_trading.broker.robinhood_executor payload
+```
+
+After an external Robinhood Agentic executor places the order:
+
+```bash
+python -m ai_trading.broker.robinhood_executor mark-executed APPROVAL_ID --order-id ROBINHOOD_ORDER_ID
+```
+
+If execution fails:
+
+```bash
+python -m ai_trading.broker.robinhood_executor mark-failed APPROVAL_ID --note "reason"
+```
+
 ## 13. Common Problems
 
 ### `ModuleNotFoundError`

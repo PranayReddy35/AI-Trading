@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from ai_trading.broker.robinhood_approvals import approval_record, build_order_payload, pending_approvals, write_approval
+from ai_trading.broker.robinhood_approvals import (
+    approval_record,
+    build_order_payload,
+    latest_approvals,
+    pending_approvals,
+    place_order_payload,
+    review_order_payload,
+    update_approval_status,
+    write_approval,
+)
 
 
 def test_build_buy_dollar_market_order_payload() -> None:
@@ -55,6 +64,7 @@ def test_approval_record_redacts_account_number() -> None:
     assert record["order"]["account_number"] == "*****6789"
     assert "account_number" not in record["executor_order"]
     assert record["execution_status"] == "pending"
+    assert record["ref_id"] == record["approval_id"]
 
 
 def test_write_and_load_pending_approval(tmp_path) -> None:
@@ -70,3 +80,36 @@ def test_write_and_load_pending_approval(tmp_path) -> None:
     loaded = pending_approvals(path)
     assert len(loaded) == 1
     assert loaded[0]["approval_id"] == record["approval_id"]
+
+
+def test_update_approval_status_removes_from_pending(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    record = approval_record(
+        {"symbol": "AAPL", "action": "BUY"},
+        account_number="123456789",
+        dollar_amount_per_trade=25.0,
+    )
+    write_approval(path, record)
+
+    update_approval_status(path, record["approval_id"], execution_status="executed", status="executed")
+
+    assert pending_approvals(path) == []
+    latest = latest_approvals(path)
+    assert len(latest) == 1
+    assert latest[0]["execution_status"] == "executed"
+
+
+def test_review_and_place_payloads_include_account_only_at_execution_time() -> None:
+    record = approval_record(
+        {"symbol": "AAPL", "action": "BUY"},
+        account_number="123456789",
+        dollar_amount_per_trade=25.0,
+    )
+
+    review_payload = review_order_payload(record, account_number="123456789")
+    place_payload = place_order_payload(record, account_number="123456789")
+
+    assert review_payload["account_number"] == "123456789"
+    assert "ref_id" not in review_payload
+    assert place_payload["account_number"] == "123456789"
+    assert place_payload["ref_id"] == record["approval_id"]

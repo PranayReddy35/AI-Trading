@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := $(PYTHON) -m pip
 STREAMLIT := $(PYTHON) -m streamlit
 
-.PHONY: setup install test health robinhood-health robinhood-intent robinhood-intent-with-quote dashboard bot scanner
+.PHONY: setup install test health robinhood-health robinhood-intent robinhood-intent-with-quote robinhood-approvals robinhood-executor-payload dashboard bot scanner
 
 setup:
 	python3 -m venv .venv
@@ -26,6 +26,12 @@ robinhood-intent:
 
 robinhood-intent-with-quote:
 	$(PYTHON) -m ai_trading.broker.robinhood_intents latest --quote-json "$(QUOTE_JSON)"
+
+robinhood-approvals:
+	$(PYTHON) -m ai_trading.broker.robinhood_executor list
+
+robinhood-executor-payload:
+	$(PYTHON) -m ai_trading.broker.robinhood_executor payload
 
 dashboard:
 	$(STREAMLIT) run ai_trading/dashboard.py --server.headless true --server.port 8501 --browser.gatherUsageStats false

@@ -360,3 +360,43 @@ An approval record contains:
 - Robinhood-compatible executor payload without storing the full account number.
 
 The missing final piece is the secure executor that can consume this queue and call Robinhood Agentic execution. The executor must run in a trusted environment with access to the Robinhood Agentic connector or a supported Robinhood execution backend.
+
+### Path B Phase 2: Executor CLI
+
+The repo includes an executor queue processor:
+
+```bash
+python -m ai_trading.broker.robinhood_executor list
+python -m ai_trading.broker.robinhood_executor next
+python -m ai_trading.broker.robinhood_executor payload
+```
+
+The `payload` command prints the exact payloads needed for:
+
+```text
+review_equity_order
+place_equity_order
+```
+
+The place payload includes a stable `ref_id` so retries can be idempotent.
+
+After an external Robinhood Agentic executor places the order, mark it:
+
+```bash
+python -m ai_trading.broker.robinhood_executor mark-executed APPROVAL_ID --order-id ROBINHOOD_ORDER_ID
+```
+
+If execution fails:
+
+```bash
+python -m ai_trading.broker.robinhood_executor mark-failed APPROVAL_ID --note "reason"
+```
+
+For a future trusted backend, dispatch approvals by webhook:
+
+```bash
+ROBINHOOD_EXECUTOR_WEBHOOK_URL="https://your-trusted-executor.example/robinhood" \
+python -m ai_trading.broker.robinhood_executor dispatch-webhook APPROVAL_ID
+```
+
+That webhook receiver must own the actual Robinhood Agentic execution call and must implement authentication, idempotency, logging, and a kill switch.

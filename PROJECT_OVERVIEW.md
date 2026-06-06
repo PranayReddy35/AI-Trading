@@ -66,6 +66,7 @@ ai_trading/config.py
 | `ai_trading/runner.py` | Schedules/runs bot cycles and health checks. |
 | `ai_trading/scanner.py` | CLI and library for stock scanning. |
 | `ai_trading/broker/robinhood_intents.py` | Inspect latest Robinhood intent records. |
+| `ai_trading/broker/robinhood_executor.py` | Process dashboard-approved Robinhood execution queue records. |
 | `ai_trading/broker/robinhood_health.py` | Validate Robinhood Agentic config. |
 | `ai_trading/options/runner.py` | Options scanner/trader CLI. |
 
@@ -260,6 +261,13 @@ Inspect Robinhood intent:
 
 ```bash
 python -m ai_trading.broker.robinhood_intents latest
+```
+
+List and export Robinhood approval payloads:
+
+```bash
+python -m ai_trading.broker.robinhood_executor list
+python -m ai_trading.broker.robinhood_executor payload
 ```
 
 ## Make Targets

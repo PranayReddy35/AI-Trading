@@ -127,9 +127,12 @@ def approval_record(
     )
     redacted_order = dict(order)
     redacted_order["account_number"] = mask_account_number(account_number)
+    approval_id = str(uuid.uuid4())
     return {
-        "approval_id": str(uuid.uuid4()),
+        "approval_id": approval_id,
+        "ref_id": approval_id,
         "created_at": _now(),
+        "updated_at": _now(),
         "status": status,
         "approved_by": approved_by,
         "order": redacted_order,
@@ -164,9 +167,70 @@ def load_approvals(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def latest_approvals(path: str | Path) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for record in load_approvals(path):
+        approval_id = str(record.get("approval_id") or "")
+        if not approval_id:
+            continue
+        if approval_id not in by_id:
+            order.append(approval_id)
+        by_id[approval_id] = record
+    return [by_id[approval_id] for approval_id in order if approval_id in by_id]
+
+
+def get_approval(path: str | Path, approval_id: str) -> dict[str, Any] | None:
+    for record in reversed(load_approvals(path)):
+        if str(record.get("approval_id") or "") == approval_id:
+            return record
+    return None
+
+
 def pending_approvals(path: str | Path) -> list[dict[str, Any]]:
     return [
-        record for record in load_approvals(path)
+        record for record in latest_approvals(path)
         if str(record.get("execution_status") or "").lower() == "pending"
         and str(record.get("status") or "").lower().startswith("approved")
     ]
+
+
+def update_approval_status(
+    path: str | Path,
+    approval_id: str,
+    *,
+    execution_status: str,
+    status: str | None = None,
+    note: str = "",
+    order_id: str = "",
+    execution_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = get_approval(path, approval_id)
+    if current is None:
+        raise ValueError(f"No approval found for approval_id={approval_id}.")
+    updated = dict(current)
+    updated["updated_at"] = _now()
+    updated["execution_status"] = execution_status
+    if status:
+        updated["status"] = status
+    if note:
+        updated["execution_note"] = note
+    if order_id:
+        updated["order_id"] = order_id
+    if execution_result:
+        updated["execution_result"] = execution_result
+    return write_approval(path, updated)
+
+
+def review_order_payload(record: dict[str, Any], *, account_number: str) -> dict[str, str]:
+    order = {**record.get("executor_order", {})}
+    order["account_number"] = account_number
+    order.pop("ref_id", None)
+    return {key: str(value) for key, value in order.items() if value is not None}
+
+
+def place_order_payload(record: dict[str, Any], *, account_number: str) -> dict[str, str]:
+    order = {**record.get("executor_order", {})}
+    order["account_number"] = account_number
+    order["ref_id"] = str(record.get("ref_id") or record.get("approval_id") or uuid.uuid4())
+    return {key: str(value) for key, value in order.items() if value is not None}
