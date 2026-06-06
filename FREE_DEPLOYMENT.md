@@ -36,6 +36,107 @@ Poor fit:
 - Durable local files that must survive app restarts.
 - Guaranteed real-time execution.
 
+## How to Overcome the Poor Fits
+
+The solution is not to force Streamlit Cloud to behave like a trading server. Use Streamlit as the UI, then move state, scheduling, and execution-adjacent work into services that are better suited for those jobs.
+
+| Problem | Free workaround | More robust option | Remaining tradeoff |
+| --- | --- | --- | --- |
+| Always-on autonomous trading loops | Run bot cycles locally with `python -m ai_trading.bot --no-confirm`, or trigger dry-run scans from GitHub Actions. | Cheap VPS, home mini-PC, or cloud VM running a supervised process. | Free web apps can sleep/restart; always-on reliability usually costs money. |
+| Long-running schedulers | Use GitHub Actions `schedule` for non-live dry-run scans/reports. | VPS cron/systemd timer or managed job scheduler. | Scheduled jobs can be delayed; do not use free scheduled jobs for time-critical live execution. |
+| Local Robinhood MCP/Agentic connector access | Keep Robinhood execution review local/manual; Streamlit only displays intents and queues. | Build a secure backend service that has authorized broker/API access and strong audit controls. | Do not expose Robinhood credentials or direct order execution through a public dashboard. |
+| Durable local files | Store snapshots, intents, and journal data in Supabase/Postgres or another external database. | Managed Postgres plus backups. | Free databases can pause or hit limits; keep schema/backups reproducible. |
+| Guaranteed real-time execution | Use dashboard for review only; rely on broker-side data/order confirmations. | Broker API backend near market-data/execution provider with monitoring. | You can reduce latency, but you cannot guarantee real-time behavior on public internet/free infra. |
+
+### Recommended Robust Free-ish Architecture
+
+```text
+Streamlit Cloud UI
+    |
+    +--> Reads config from Streamlit Secrets
+    +--> Reads/writes durable state from external DB
+    +--> Shows scanners, action queue, portfolio review
+    |
+External DB: Supabase/Postgres
+    |
+    +--> Stores snapshots, order intents, journal events, user settings
+    |
+Scheduler: local cron, GitHub Actions, or VPS cron
+    |
+    +--> Runs scans/bot dry-run cycles
+    +--> Writes results to DB
+    +--> Sends Discord alerts
+    |
+Manual Robinhood Agentic Review
+    |
+    +--> User reviews/places real Robinhood orders
+```
+
+### Practical Upgrade Path
+
+1. **Phase 1: Free UI**
+   Deploy Streamlit Cloud with `BOT_STOCK_DRY_RUN=true`. Use it for scanning, queue review, and Discord alerts.
+
+2. **Phase 2: Durable State**
+   Add an external database for snapshots, journal events, scanner results, and order intents. This removes dependence on Streamlit's local filesystem.
+
+3. **Phase 3: Scheduled Dry Runs**
+   Add scheduled dry-run scans. Use GitHub Actions for reports, or local cron if you want the job to run from your own machine.
+
+4. **Phase 4: Robust Worker**
+   Move the bot loop to a supervised worker on a VPS or always-on local machine. Keep the Streamlit app as the cockpit.
+
+5. **Phase 5: Execution Controls**
+   Keep real orders behind manual confirmation, strict risk gates, audit logs, and Discord alerts. Do not let a public dashboard place live orders without a separate approval layer.
+
+### What We Should Build Next
+
+To make this app robust for cloud use, the next engineering steps are:
+
+1. Add a storage abstraction:
+
+```text
+local JSONL/files  <-->  Supabase/Postgres
+```
+
+2. Store these records outside the Streamlit filesystem:
+
+```text
+scanner_results
+sell_scanner_results
+robinhood_portfolio_snapshots
+robinhood_quote_snapshots
+order_intents
+journal_events
+dashboard_settings
+```
+
+3. Add a background-worker command:
+
+```bash
+python -m ai_trading.worker --scan --write-db
+python -m ai_trading.worker --bot-cycle --dry-run --write-db
+```
+
+4. Add dashboard DB mode:
+
+```toml
+BOT_STORAGE_BACKEND = "supabase"
+SUPABASE_URL = "..."
+SUPABASE_SERVICE_ROLE_KEY = "..."
+```
+
+5. Add health checks:
+
+```text
+last_scan_at
+last_snapshot_at
+last_worker_heartbeat_at
+last_discord_alert_at
+```
+
+This lets the dashboard show whether the worker is alive and whether data is fresh.
+
 ## Important Robinhood Limitation
 
 The local app uses Robinhood snapshot files:
