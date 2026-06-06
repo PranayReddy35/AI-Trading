@@ -34,6 +34,7 @@ Important Robinhood behavior:
 - `BOT_BROKER=robinhood` enables the Robinhood Agentic facade.
 - `BOT_STOCK_DRY_RUN=true` keeps local stock orders in review-intent mode.
 - Robinhood order intents are written to `logs/robinhood_order_intents.jsonl`.
+- Dashboard approvals are written to `logs/robinhood_approvals.jsonl`.
 - Real Robinhood order placement still requires external Agentic review/confirmation.
 - The dashboard reads Robinhood portfolio/quote snapshots from local JSON files.
 
@@ -154,6 +155,7 @@ ROBINHOOD_AGENTIC_ACCOUNT_NUMBER=
 ROBINHOOD_USE_DOLLAR_ORDERS=true
 ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE=25
 ROBINHOOD_ORDER_INTENTS_PATH=logs/robinhood_order_intents.jsonl
+ROBINHOOD_APPROVALS_PATH=logs/robinhood_approvals.jsonl
 ROBINHOOD_QUOTES_PATH=logs/robinhood_quotes.json
 ROBINHOOD_PORTFOLIOS_PATH=logs/robinhood_portfolios.json
 ```
@@ -219,6 +221,7 @@ BOT_GAP_OPEN_PROTECTION_PCT=4.0
 | `logs/bot.log` | Bot runtime logs. |
 | `logs/journal.jsonl` | Structured event journal. |
 | `logs/robinhood_order_intents.jsonl` | Robinhood Agentic order intents. |
+| `logs/robinhood_approvals.jsonl` | Dashboard-approved Robinhood execution queue. |
 | `logs/robinhood_portfolios.json` | Local Robinhood portfolio snapshot. |
 | `logs/robinhood_quotes.json` | Local Robinhood quote snapshot. |
 

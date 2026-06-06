@@ -1775,6 +1775,10 @@ def _robinhood_action_queue_rows(accounts: list[dict]) -> tuple[list[dict], list
                 "action": "SELL" if any(token in action_upper for token in ("SELL", "TAKE PROFIT", "TRIM", "RISK EXIT")) else "HOLD",
                 "recommendation": action,
                 "suggested": row.get("Suggested", ""),
+                "quantity": row.get("Sellable") if any(token in action_upper for token in ("SELL", "RISK EXIT")) else None,
+                "sell_quantity": row.get("Sellable"),
+                "shares": row.get("Shares"),
+                "sellable": row.get("Sellable"),
                 "pnl_dollars": row.get("P&L $"),
                 "pnl_pct": row.get("P&L %"),
                 "reason": row.get("Why", ""),
@@ -2007,6 +2011,123 @@ def _notify_queue_batch(rows: list[dict], action: str, label: str, key_prefix: s
             st.warning("Notification was not sent. Check webhook URLs and BOT_NOTIFY_EVENTS.")
 
 
+def _approval_queue_path() -> str:
+    return os.environ.get("ROBINHOOD_APPROVALS_PATH", "logs/robinhood_approvals.jsonl")
+
+
+def _approval_candidate_label(row: dict) -> str:
+    return (
+        f"{row.get('State', '—')} · {row.get('Action', '—')} · {row.get('Symbol', '—')} · "
+        f"priority {safe_float(row.get('Priority'), 0.0):.1f}"
+    )
+
+
+def _approve_action_plan_row(row: dict) -> dict[str, Any]:
+    from ai_trading.broker.robinhood_approvals import approval_record, write_approval
+
+    account_number = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "").strip()
+    if not account_number:
+        raise ValueError("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is required before approvals can be created.")
+    payload = row.get("_payload", {}) if isinstance(row.get("_payload"), dict) else {}
+    payload = {
+        **payload,
+        "symbol": row.get("Symbol") or payload.get("symbol"),
+        "action": _queue_action_family(row),
+        "suggested": row.get("Suggested") or payload.get("suggested"),
+        "estimated_spend": row.get("Est. Spend") or payload.get("estimated_spend"),
+        "reason": row.get("Reason") or payload.get("reason"),
+        "gate_reason": row.get("Gate Reason") or payload.get("gate_reason"),
+        "priority": row.get("Priority") or payload.get("priority"),
+    }
+    record = approval_record(
+        payload,
+        account_number=account_number,
+        dollar_amount_per_trade=safe_float(os.environ.get("ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE"), 0.0),
+        approved_by="streamlit_dashboard",
+    )
+    return write_approval(_approval_queue_path(), record)
+
+
+def _render_robinhood_approval_panel(rows: list[dict]) -> None:
+    from ai_trading.broker.robinhood_approvals import pending_approvals
+
+    st.subheader("Approve For Robinhood Execution")
+    candidates = [
+        row for row in rows
+        if _queue_action_family(row) in {"BUY", "SELL"}
+        and str(row.get("State", "")).upper() in {"READY", "REVIEW"}
+    ]
+    if not candidates:
+        st.caption("No ready buy/sell rows available for approval.")
+    else:
+        labels = [_approval_candidate_label(row) for row in candidates]
+        selected_label = st.selectbox("Candidate", labels, key="rh_approval_candidate")
+        selected = candidates[labels.index(selected_label)]
+        payload = selected.get("_payload", {}) if isinstance(selected.get("_payload"), dict) else {}
+        preview_payload = {
+            "symbol": selected.get("Symbol"),
+            "action": _queue_action_family(selected),
+            "state": selected.get("State"),
+            "suggested": selected.get("Suggested"),
+            "estimated_spend": selected.get("Est. Spend"),
+            "price": selected.get("Price"),
+            "reason": selected.get("Reason"),
+            "gate_reason": selected.get("Gate Reason"),
+            "payload": payload,
+        }
+        with st.expander("Approval Preview", expanded=False):
+            st.json(preview_payload)
+        confirm = st.checkbox(
+            "I approve this candidate for the Robinhood executor queue",
+            key="rh_approval_confirm",
+        )
+        if st.button("Approve Selected Candidate", type="primary", disabled=not confirm, key="rh_approve_selected"):
+            try:
+                record = _approve_action_plan_row(selected)
+                _record_dashboard_event(
+                    journal_path,
+                    "robinhood_approval",
+                    {
+                        "approval_id": record.get("approval_id"),
+                        "order": record.get("order"),
+                        "execution_status": record.get("execution_status"),
+                    },
+                )
+                _notify_dashboard_event(
+                    "trade",
+                    f"Approved {record['order']['side'].upper()} {record['order']['symbol']} for Robinhood execution queue",
+                    {
+                        "action": record["order"]["side"].upper(),
+                        "symbol": record["order"]["symbol"],
+                        "approval_id": record.get("approval_id"),
+                        "status": record.get("status"),
+                        "order": record.get("order"),
+                    },
+                )
+                st.success(f"Approved and queued: {record['approval_id']}")
+                st.code(json.dumps(record.get("executor_order", {}), indent=2), language="json")
+            except Exception as exc:
+                st.error(f"Approval failed: {exc}")
+
+    approvals = pending_approvals(_approval_queue_path())
+    if approvals:
+        rows_out = []
+        for item in reversed(approvals[-10:]):
+            order = item.get("order", {})
+            rows_out.append({
+                "Created": format_price_time(str(item.get("created_at") or "")),
+                "Approval ID": item.get("approval_id", ""),
+                "Status": item.get("status", ""),
+                "Side": str(order.get("side", "")).upper(),
+                "Symbol": order.get("symbol", ""),
+                "Amount/Qty": order.get("dollar_amount") or order.get("quantity") or "—",
+                "Execution": item.get("execution_status", ""),
+            })
+        st.dataframe(pd.DataFrame(rows_out), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No pending Robinhood approvals yet.")
+
+
 def _display_queue(rows: list[dict], empty: str, key_prefix: str) -> None:
     if not rows:
         st.info(empty)
@@ -2159,6 +2280,7 @@ def _render_action_queue(records: list[dict]) -> None:
                 f"Showing {len(filtered_plan)} of {len(action_plan)} rows. "
                 "Discord routing uses buy, sell, and other webhooks; blocked rows are excluded."
             )
+        _render_robinhood_approval_panel(filtered_plan)
     else:
         st.info("Run the scanners and score Robinhood holdings to populate today's action plan.")
 

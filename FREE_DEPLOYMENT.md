@@ -107,6 +107,7 @@ sell_scanner_results
 robinhood_portfolio_snapshots
 robinhood_quote_snapshots
 order_intents
+approval_queue
 journal_events
 dashboard_settings
 ```
@@ -205,6 +206,7 @@ ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE = "25"
 ROBINHOOD_AGENTIC_BUYING_POWER = "0"
 ROBINHOOD_AGENTIC_EQUITY = "0"
 ROBINHOOD_ORDER_INTENTS_PATH = "logs/robinhood_order_intents.jsonl"
+ROBINHOOD_APPROVALS_PATH = "logs/robinhood_approvals.jsonl"
 ROBINHOOD_QUOTES_PATH = "logs/robinhood_quotes.json"
 ROBINHOOD_PORTFOLIOS_PATH = "logs/robinhood_portfolios.json"
 ROBINHOOD_SNAPSHOT_TTL_SEC = "300"
@@ -337,3 +339,24 @@ That requires:
 - Kill switch.
 
 Until that approval backend exists, the safest mobile setup is dashboard + Discord + manual Robinhood confirmation.
+
+### Path B: Robinhood Approval Queue
+
+The dashboard now supports the first half of Path B:
+
+```text
+Action Queue row -> Approve Selected Candidate -> logs/robinhood_approvals.jsonl
+```
+
+An approval record contains:
+
+- Approval ID.
+- Redacted account number.
+- Buy/sell side.
+- Symbol.
+- Dollar amount or quantity.
+- Reason and gate context.
+- Pending execution status.
+- Robinhood-compatible executor payload without storing the full account number.
+
+The missing final piece is the secure executor that can consume this queue and call Robinhood Agentic execution. The executor must run in a trusted environment with access to the Robinhood Agentic connector or a supported Robinhood execution backend.

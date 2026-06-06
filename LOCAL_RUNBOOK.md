@@ -110,6 +110,7 @@ ROBINHOOD_AGENTIC_ACCOUNT_NUMBER=
 ROBINHOOD_USE_DOLLAR_ORDERS=true
 ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE=25
 ROBINHOOD_ORDER_INTENTS_PATH=logs/robinhood_order_intents.jsonl
+ROBINHOOD_APPROVALS_PATH=logs/robinhood_approvals.jsonl
 ROBINHOOD_QUOTES_PATH=logs/robinhood_quotes.json
 ROBINHOOD_PORTFOLIOS_PATH=logs/robinhood_portfolios.json
 ROBINHOOD_SNAPSHOT_TTL_SEC=300
@@ -279,6 +280,7 @@ Common files:
 logs/bot.log
 logs/journal.jsonl
 logs/robinhood_order_intents.jsonl
+logs/robinhood_approvals.jsonl
 logs/robinhood_portfolios.json
 logs/robinhood_quotes.json
 ```
@@ -299,6 +301,12 @@ View recent Robinhood intents:
 
 ```bash
 tail -n 20 logs/robinhood_order_intents.jsonl
+```
+
+View recent dashboard approvals:
+
+```bash
+tail -n 20 logs/robinhood_approvals.jsonl
 ```
 
 ## 13. Common Problems
