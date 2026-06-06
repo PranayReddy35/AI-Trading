@@ -54,6 +54,14 @@ class RobinhoodAgenticBroker:
     def get_all_tradable_symbols(self) -> list[str]:
         return self._market.get_all_tradable_symbols()
 
+    def get_latest_price(self, symbol: str) -> float:
+        """Return latest market-data price while Robinhood execution stays intent-only."""
+        return self._market.get_latest_price(symbol)
+
+    def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Return latest market-data prices while Robinhood execution stays intent-only."""
+        return self._market.get_latest_prices(symbols)
+
     def account_state(self) -> dict:
         return {
             "status": "ACTIVE",
