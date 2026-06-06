@@ -270,3 +270,70 @@ python -m ai_trading.broker.robinhood_intents latest
 ```
 
 That gives you a free hosted UI without pretending a free dashboard host is a reliable trading execution server.
+
+## Using It From an iPhone Away From Home
+
+When you are away from your laptop, use the system as a mobile review-and-approval workflow.
+
+### Safe Mobile Workflow
+
+```text
+Worker runs scans / bot dry-run cycle
+    |
+    +--> Writes scanner results and order intents
+    +--> Sends Discord alert
+    |
+iPhone
+    |
+    +--> Open Streamlit dashboard
+    +--> Review Action Queue
+    +--> Review reason, score, P/L, data freshness, and gate state
+    +--> Approve manually through Robinhood Agentic / Robinhood app
+```
+
+Current behavior:
+
+- The dashboard can be used from Safari on iPhone.
+- Discord alerts can notify you when buy/sell/trim candidates appear.
+- The bot can create Robinhood order intents.
+- `BOT_STOCK_DRY_RUN=true` prevents the cloud dashboard from silently placing real stock orders.
+- Real Robinhood execution still requires manual review/confirmation.
+
+### iPhone Checklist
+
+Before leaving home:
+
+1. Make sure the Streamlit app is deployed and opens on your iPhone.
+2. Add the Streamlit URL to your iPhone home screen.
+3. Confirm Discord mobile notifications work.
+4. Confirm buy/sell/other webhooks route to the right Discord channels.
+5. Confirm `BOT_STOCK_DRY_RUN=true`.
+6. Confirm the dashboard's Action Queue clearly shows stale-data warnings.
+
+When an alert comes in:
+
+1. Open Discord and read the alert.
+2. Open Streamlit dashboard on iPhone.
+3. Go to `Action Queue`.
+4. Check `State`, `Gate Reason`, `Priority`, `P/L`, and `Reason`.
+5. If the action still makes sense, place/review the real order through Robinhood Agentic or the Robinhood app.
+6. Do not act on `BLOCK` rows.
+
+### If You Want More Automation
+
+The next safer automation step is not "let Streamlit place orders." It is:
+
+```text
+Intent created -> Discord alert -> mobile approval -> backend executes -> audit log
+```
+
+That requires:
+
+- Durable database for intents and approvals.
+- Authenticated mobile dashboard access.
+- One-time approval tokens or signed approval links.
+- Strict risk checks before execution.
+- Full audit trail.
+- Kill switch.
+
+Until that approval backend exists, the safest mobile setup is dashboard + Discord + manual Robinhood confirmation.
