@@ -63,6 +63,8 @@ Production-ready module structure:
 
 ## Setup
 
+For the project architecture and subsystem map, see [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md).
+
 For a step-by-step local operating guide, including what to do when Codex/AI credits are exhausted, see [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md).
 
 ```bash
