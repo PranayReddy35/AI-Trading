@@ -5,6 +5,8 @@ logs/
 *.egg-info/
 .env
 .streamlit/secrets.toml
+GITHUB SSH KEY
+GITHUB SSH KEY.pub
 
 # Local caches and trained model artifacts
 .cache/
