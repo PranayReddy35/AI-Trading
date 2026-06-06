@@ -2,7 +2,7 @@
 
 This document explains what the AI-Trading project is, how the main pieces fit together, and where to look when operating or modifying it.
 
-For step-by-step local commands, use [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md). For setup, environment variables, and Streamlit deployment, use [`README.md`](README.md).
+For step-by-step local commands, use [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md). For setup, environment variables, and Streamlit deployment, use [`README.md`](README.md). For free hosting guidance and limits, use [`FREE_DEPLOYMENT.md`](FREE_DEPLOYMENT.md).
 
 ## Purpose
 
@@ -318,6 +318,7 @@ Never commit:
 
 1. [`README.md`](README.md): setup, config, features, deployment.
 2. [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md): exact local commands for operating without Codex.
-3. `PROJECT_OVERVIEW.md`: architecture and subsystem map.
-4. `.env.example`: local configuration template.
-5. `.streamlit/secrets.example.toml`: Streamlit Cloud secrets template.
+3. [`FREE_DEPLOYMENT.md`](FREE_DEPLOYMENT.md): free Streamlit hosting guidance and limitations.
+4. `PROJECT_OVERVIEW.md`: architecture and subsystem map.
+5. `.env.example`: local configuration template.
+6. `.streamlit/secrets.example.toml`: Streamlit Cloud secrets template.

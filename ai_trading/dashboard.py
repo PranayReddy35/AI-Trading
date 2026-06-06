@@ -31,20 +31,22 @@ from ai_trading.time_utils import app_timezone, format_local_now
 load_dotenv(_project_root / ".env")
 
 # ── Load Streamlit Cloud secrets into environment variables ────────────────────
-# This allows the app to work on Streamlit Cloud where secrets are configured
-# via the dashboard UI and accessed through st.secrets.
-_SECRET_KEYS = [
-    "APCA_API_KEY_ID",
-    "APCA_API_SECRET_KEY",
-    "BOT_PAPER_ONLY",
-    "BOT_WEBHOOK_URL",
-]
-for _key in _SECRET_KEYS:
-    if _key not in os.environ:
-        try:
-            os.environ[_key] = st.secrets[_key]
-        except (KeyError, FileNotFoundError):
-            pass
+# Streamlit secrets are not real environment variables. Most of the app reads
+# os.environ through Settings.from_env(), so copy top-level scalar secrets here.
+def _load_streamlit_secrets_into_env() -> None:
+    try:
+        secrets = st.secrets.to_dict()
+    except (AttributeError, FileNotFoundError, KeyError):
+        return
+    except Exception:
+        return
+    for key, value in secrets.items():
+        if key in os.environ or isinstance(value, (dict, list, tuple, set)):
+            continue
+        os.environ[str(key)] = str(value)
+
+
+_load_streamlit_secrets_into_env()
 
 from ai_trading.scanner import is_market_open, scan, scan_live
 from ai_trading.data.universe import INDEX_LABELS, load_universe

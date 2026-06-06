@@ -67,6 +67,8 @@ For the project architecture and subsystem map, see [`PROJECT_OVERVIEW.md`](PROJ
 
 For a step-by-step local operating guide, including what to do when Codex/AI credits are exhausted, see [`LOCAL_RUNBOOK.md`](LOCAL_RUNBOOK.md).
 
+For free Streamlit hosting guidance and limitations, see [`FREE_DEPLOYMENT.md`](FREE_DEPLOYMENT.md).
+
 ```bash
 cd AI-Trading
 python -m venv .venv
