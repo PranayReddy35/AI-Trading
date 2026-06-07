@@ -2048,10 +2048,13 @@ def _approve_action_plan_row(row: dict) -> dict[str, Any]:
     return write_approval(_approval_queue_path(), record)
 
 
-def _render_robinhood_approval_panel(rows: list[dict]) -> None:
+def _render_robinhood_approval_panel(rows: list[dict], *, compact: bool = False) -> None:
     from ai_trading.broker.robinhood_approvals import pending_approvals
 
-    st.subheader("Approve For Robinhood Execution")
+    if compact:
+        st.caption("Approve for Robinhood execution")
+    else:
+        st.subheader("Approve For Robinhood Execution")
     candidates = [
         row for row in rows
         if _queue_action_family(row) in {"BUY", "SELL"}
@@ -2123,7 +2126,11 @@ def _render_robinhood_approval_panel(rows: list[dict]) -> None:
                 "Amount/Qty": order.get("dollar_amount") or order.get("quantity") or "—",
                 "Execution": item.get("execution_status", ""),
             })
-        st.dataframe(pd.DataFrame(rows_out), use_container_width=True, hide_index=True)
+        if compact:
+            with st.expander(f"Pending approvals ({len(approvals)})", expanded=False):
+                st.dataframe(pd.DataFrame(rows_out), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(pd.DataFrame(rows_out), use_container_width=True, hide_index=True)
     else:
         st.caption("No pending Robinhood approvals yet.")
 
@@ -2168,18 +2175,6 @@ def _render_action_queue(records: list[dict]) -> None:
         for holding in account.get("positions", [])
     }
 
-    if accounts and not st.session_state.get("rh_portfolio_rows"):
-        if st.button("Score Robinhood Holdings", type="primary", key="queue_score_holdings"):
-            with st.spinner("Scoring Robinhood holdings..."):
-                try:
-                    rows, full = _recommend_robinhood_holdings(accounts, "short")
-                    st.session_state["rh_portfolio_rows"] = rows
-                    st.session_state["rh_portfolio_full"] = full
-                    st.session_state["rh_portfolio_ts"] = format_local_now("%I:%M:%S %p %Z")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Scoring failed: {exc}")
-
     ops = _action_queue_operating_summary(accounts, records)
     buy_rows = _scanner_buy_queue_rows(records, held_symbols)
     sell_rows, hold_rows = _robinhood_action_queue_rows(accounts)
@@ -2198,6 +2193,27 @@ def _render_action_queue(records: list[dict]) -> None:
     h3.metric("Open Slots", f"{int(ops['open_slots'])}/{int(ops['max_open_positions'])}")
     h4.metric("Trades Left Today", f"{int(ops['daily_trade_slots'])}/{int(ops['max_daily_trades'])}")
     h5.metric("Trade Size", fmt_money(ops["dollar_per_trade"]) if ops["dollar_per_trade"] > 0 else "share sizing")
+
+    top_cmd_1, top_cmd_2, top_cmd_3 = st.columns([1, 1, 2])
+    with top_cmd_1:
+        if accounts and st.button("Score / Rescore Holdings", type="primary", key="queue_score_holdings_top", use_container_width=True):
+            with st.spinner("Scoring Robinhood holdings..."):
+                try:
+                    rows, full = _recommend_robinhood_holdings(accounts, "short")
+                    st.session_state["rh_portfolio_rows"] = rows
+                    st.session_state["rh_portfolio_full"] = full
+                    st.session_state["rh_portfolio_ts"] = format_local_now("%I:%M:%S %p %Z")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Scoring failed: {exc}")
+        elif not accounts:
+            st.caption("Load Robinhood snapshot to score holdings.")
+    with top_cmd_2:
+        if st.button("Refresh Queue Cache", key="queue_refresh_cache_top", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+    with top_cmd_3:
+        st.caption("Command bar: score holdings, approve candidates, and send Discord alerts without scrolling.")
 
     with st.expander("Operator Health", expanded=False):
         status_l, status_r = st.columns([1, 1])
@@ -2268,19 +2284,20 @@ def _render_action_queue(records: list[dict]) -> None:
             and row.get("Category") in category_filter
             and safe_float(row.get("Priority"), 0.0) >= min_priority
         ]
+        st.markdown("**Queue Commands**")
+        n1, n2, n3 = st.columns([1.15, 1, 1])
+        with n1:
+            _render_robinhood_approval_panel(filtered_plan, compact=True)
+        with n2:
+            _notify_queue_batch(filtered_plan, "BUY", "BUY candidates", "action_plan_buy")
+        with n3:
+            _notify_queue_batch(filtered_plan, "SELL", "SELL candidates", "action_plan_sell")
+        st.caption(
+            f"Showing {len(filtered_plan)} of {len(action_plan)} rows. "
+            "Blocked rows are excluded from approval and batch alerts."
+        )
         plan_table = pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in filtered_plan])
         st.dataframe(plan_table, use_container_width=True, hide_index=True, height=min(120 + len(action_plan) * 35, 700))
-        n1, n2, n3 = st.columns([1, 1, 2])
-        with n1:
-            _notify_queue_batch(filtered_plan, "BUY", "BUY candidates", "action_plan_buy")
-        with n2:
-            _notify_queue_batch(filtered_plan, "SELL", "SELL candidates", "action_plan_sell")
-        with n3:
-            st.caption(
-                f"Showing {len(filtered_plan)} of {len(action_plan)} rows. "
-                "Discord routing uses buy, sell, and other webhooks; blocked rows are excluded."
-            )
-        _render_robinhood_approval_panel(filtered_plan)
     else:
         st.info("Run the scanners and score Robinhood holdings to populate today's action plan.")
 
@@ -3270,9 +3287,17 @@ elif active_key == "scanner":
             "**RSI oversold** (20%), **volume surge** (15%), **trend consistency** (10%)."
         )
     st.caption("Technical scoring uses Alpaca/yfinance historical bars; displayed prices prefer Robinhood quote snapshots.")
+    scan_cmd_1, scan_cmd_2 = st.columns([1, 3])
+    with scan_cmd_1:
+        page_run_scan = st.button("Run Buy Scanner", type="primary", key="scanner_run_page", use_container_width=True)
+    with scan_cmd_2:
+        st.caption("Primary scanner action is available here and in the sidebar.")
+    if page_run_scan:
+        _lock_autorefresh()
+    scanner_run_now = run_scan or page_run_scan
 
     # Resolve symbol list. Remote/full index membership is loaded only when scanning.
-    if run_scan:
+    if scanner_run_now:
         if _use_full_universe:
             with st.spinner("Loading full universe from Alpaca…"):
                 symbols_to_scan = _sidebar_universe_symbols(load_remote=True)
@@ -3293,7 +3318,7 @@ elif active_key == "scanner":
 
     # Apply pre-scan snapshot filter to trim the universe before deep scanning
     pre_filter_count = len(symbols_to_scan)
-    if run_scan and symbols_to_scan and _use_filters:
+    if scanner_run_now and symbols_to_scan and _use_filters:
         _filter_status = st.empty()
         _filter_status.info(f"⚡ Pre-filtering {pre_filter_count:,} symbols via snapshots…")
         symbols_to_scan = _snapshot_filter(
@@ -3311,22 +3336,22 @@ elif active_key == "scanner":
             f"chg {_f_min_chg:+.1f}% to {_f_max_chg:+.1f}%)"
         )
 
-    if symbols_to_scan and not run_scan:
+    if symbols_to_scan and not scanner_run_now:
         st.info(
             f"Watchlist: **{len(symbols_to_scan):,} symbols** — "
             f"{', '.join(symbols_to_scan[:12])}{'…' if len(symbols_to_scan) > 12 else ''}"
         )
-    elif not symbols_to_scan and not run_scan:
+    elif not symbols_to_scan and not scanner_run_now:
         if _use_full_universe:
-            st.info("Full universe mode — click **▶ Run Scanner Now** to fetch all ~12K tickers and scan.")
+            st.info("Full universe mode — click **Run Buy Scanner** to fetch all ~12K tickers and scan.")
         elif _use_index_universe:
             labels = ", ".join(INDEX_LABELS.get(a, a) for a in _selected_indexes) or "selected indexes"
-            st.info(f"Index mode — click **▶ Run Scanner Now** to fetch and scan {labels}.")
+            st.info(f"Index mode — click **Run Buy Scanner** to fetch and scan {labels}.")
         else:
-            st.info("Click **▶ Run Scanner Now** in the sidebar to scan the watchlist.")
+            st.info("Click **Run Buy Scanner** to scan the watchlist.")
 
     # Only scan when user explicitly clicks the button; run the deep scan off the render thread.
-    needs_scan = run_scan
+    needs_scan = scanner_run_now
     if needs_scan and symbols_to_scan:
         _mode_label = "live" if market_open else "EOD"
         started = _start_background_task(
@@ -3434,7 +3459,7 @@ elif active_key == "scanner":
         st.markdown("")
 
     if not results and not run_scan and not scan_pending:
-        st.info("Click **▶ Run Scanner Now** in the sidebar to scan the watchlist.")
+            st.info("Click **Run Buy Scanner** above to scan the watchlist.")
 
     if results:
         # Legend
@@ -3736,7 +3761,7 @@ elif active_key == "scanner":
         elif scan_pending:
             pass
         elif not needs_scan:
-            st.info("Click **▶ Run Scanner Now** in the sidebar to scan the market.")
+            st.info("Click **Run Buy Scanner** above to scan the market.")
         else:
             st.warning("No results returned. Market data may be unavailable.")
 
