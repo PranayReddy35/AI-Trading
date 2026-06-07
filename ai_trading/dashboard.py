@@ -24,6 +24,7 @@ if str(_project_root) not in sys.path:
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ai_trading.env import load_dotenv
 from ai_trading.time_utils import app_timezone, format_local_now
@@ -215,13 +216,13 @@ def _poll_background_task(key: str) -> dict[str, Any] | None:
 
 def _schedule_scan_poll(seconds: int = 2) -> None:
     delay_ms = max(500, int(seconds * 1000))
-    st.markdown(
+    components.html(
         f"""
         <script>
         setTimeout(function() {{ window.location.reload(); }}, {delay_ms});
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
@@ -3458,8 +3459,8 @@ elif active_key == "scanner":
         )
         st.markdown("")
 
-    if not results and not run_scan and not scan_pending:
-            st.info("Click **Run Buy Scanner** above to scan the watchlist.")
+    if not results and not scanner_run_now and not scan_pending:
+        st.info("Click **Run Buy Scanner** above to scan the watchlist.")
 
     if results:
         # Legend
@@ -3541,7 +3542,7 @@ elif active_key == "scanner":
         total_pages = max(1, (total_rows + _PAGE_SIZE - 1) // _PAGE_SIZE)
 
         # Reset page when scan reruns or search changes
-        if run_scan or st.session_state.get("_last_search") != search_q:
+        if scanner_run_now or st.session_state.get("_last_search") != search_q:
             st.session_state["scanner_page"] = 0
             st.session_state["_last_search"] = search_q
         current_page = st.session_state.get("scanner_page", 0)
