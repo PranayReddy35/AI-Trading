@@ -3792,6 +3792,45 @@ elif active_key == "sell":
 
     # Build symbol list
     def _load_open_positions() -> list[dict]:
+        if os.environ.get("BOT_BROKER", "alpaca").strip().lower() == "robinhood":
+            path = str(globals().get("robinhood_portfolios_path", "") or os.environ.get("ROBINHOOD_PORTFOLIOS_PATH", "logs/robinhood_portfolios.json"))
+            accounts = load_robinhood_portfolio_snapshot(path)
+            if not accounts:
+                st.warning(
+                    "No Robinhood portfolio snapshot is loaded. Refresh/create "
+                    f"`{path}` or uncheck Scan my open positions."
+                )
+                return []
+            symbols = tuple(dict.fromkeys(
+                str(h.get("symbol", "")).upper()
+                for account in accounts
+                for h in account.get("positions", [])
+                if h.get("symbol")
+            ))
+            latest_map = _robinhood_latest_price_map(symbols)
+            rows: list[dict] = []
+            for account in accounts:
+                for holding in account.get("positions", []):
+                    symbol = str(holding.get("symbol", "")).upper()
+                    if not symbol:
+                        continue
+                    price, market_value, pnl, pnl_pct = _robinhood_price_for_holding(
+                        holding,
+                        latest_map.get(symbol, {}),
+                    )
+                    rows.append({
+                        "symbol": symbol,
+                        "qty": safe_float(holding.get("shares"), 0.0),
+                        "market_value": market_value,
+                        "unrealized_pl": pnl,
+                        "unrealized_plpc": pnl_pct / 100.0 if pnl_pct else 0.0,
+                        "avg_cost": safe_float(holding.get("avg_cost"), 0.0),
+                        "current_price": price,
+                        "account": account.get("label", "Robinhood"),
+                    })
+            if rows:
+                st.caption(f"Loaded {len(rows)} Robinhood snapshot positions for sell scan.")
+            return rows
         try:
             from ai_trading.broker.alpaca_broker import AlpacaBroker
             from ai_trading.config import Settings
@@ -3799,7 +3838,10 @@ elif active_key == "sell":
             _b = AlpacaBroker(api_key=_s.api_key, api_secret=_s.api_secret, paper=_s.paper_only)
             return _b.all_positions()
         except Exception as exc:
-            st.error(f"Could not load positions: {exc}")
+            st.error(
+                "Could not load Alpaca positions. Check APCA_API_KEY_ID/APCA_API_SECRET_KEY, "
+                f"BOT_PAPER_ONLY, and Alpaca account permissions. Raw error: {exc}"
+            )
             return []
 
     if _ss_run:
