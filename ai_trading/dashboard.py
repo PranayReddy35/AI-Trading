@@ -27,6 +27,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from ai_trading.env import load_dotenv
+from ai_trading.broker.robinhood_snapshot import refresh_snapshots
+from ai_trading.research import (
+    ResearchPromptSpec,
+    build_prompt_for_mode,
+    build_research_packet,
+    build_debate_prompt,
+    build_earnings_prompt,
+    build_investment_memo_prompt,
+    build_valuation_prompt,
+)
 from ai_trading.time_utils import app_timezone, format_local_now
 
 load_dotenv(_project_root / ".env")
@@ -68,10 +78,19 @@ st.markdown(
         border: 1px solid rgba(148, 163, 184, 0.22);
         border-radius: 8px;
         padding: 0.75rem 0.85rem;
+        min-height: 108px;
       }
       div[data-testid="stMetricLabel"] p {
         color: #94a3b8;
         font-size: 0.78rem;
+      }
+      div[data-testid="stMetricValue"] > div {
+        font-size: 1.18rem;
+        line-height: 1.15;
+        white-space: normal;
+      }
+      div[data-testid="stMetricDelta"] > div {
+        white-space: normal;
       }
       .ops-section {
         border-top: 1px solid rgba(148, 163, 184, 0.18);
@@ -477,8 +496,8 @@ def _snapshot_filter(
 
 # ── Workspace navigation ──────────────────────────────────────────────────────
 _qp_page = st.query_params.get("page", "portfolio")
-_PAGE_LABELS = ["Portfolio", "Action Queue", "Buy Scanner", "Sell Scanner", "Position Advisor", "Patterns", "Options"]
-_PAGE_KEYS = ["portfolio", "actions", "scanner", "sell", "advisor", "patterns", "options"]
+_PAGE_LABELS = ["Portfolio", "Action Queue", "Buy Scanner", "Sell Scanner", "Position Advisor", "Patterns", "Options", "Research"]
+_PAGE_KEYS = ["portfolio", "actions", "scanner", "sell", "advisor", "patterns", "options", "research"]
 _page_idx = _PAGE_KEYS.index(_qp_page) if _qp_page in _PAGE_KEYS else 0
 active_page = st.sidebar.radio(
     "Workspace",
@@ -621,6 +640,39 @@ def _apply_symbol_cleanup(symbols: list[str]) -> list[str]:
     return cleaned
 
 
+def _sidebar_snapshot_file_status(path: str, ttl_seconds: int | None = None) -> tuple[bool, str]:
+    if not path:
+        return False, "missing"
+    p = Path(path)
+    if not p.exists():
+        return False, "missing"
+    try:
+        ttl = max(30, int(ttl_seconds or os.environ.get("ROBINHOOD_SNAPSHOT_TTL_SEC", "300") or 300))
+    except ValueError:
+        ttl = 300
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    updated_at = str(payload.get("updated_at") or "") if isinstance(payload, dict) else ""
+    try:
+        age = (
+            max(0.0, (datetime.now(timezone.utc) - parse_ts(updated_at)).total_seconds())
+            if updated_at
+            else max(0.0, time.time() - p.stat().st_mtime)
+        )
+    except Exception:
+        return False, "unavailable"
+    fresh = age <= ttl
+    if age < 60:
+        age_label = f"{age:.0f}s"
+    elif age < 3600:
+        age_label = f"{age / 60:.1f}m"
+    else:
+        age_label = f"{age / 3600:.1f}h"
+    return fresh, f"{'fresh' if fresh else 'stale'} · {age_label}"
+
+
 def _sidebar_universe_symbols(*, load_remote: bool) -> list[str]:
     if _use_full_universe:
         return _apply_symbol_cleanup(_load_full_universe()) if load_remote else []
@@ -629,6 +681,16 @@ def _sidebar_universe_symbols(*, load_remote: bool) -> list[str]:
             _load_index_universe(tuple(_selected_indexes), _refresh_index_universe)
         ) if load_remote else []
     return _apply_symbol_cleanup([s for s in scanner_symbols_input.split(",") if s.strip()])
+
+
+def _robinhood_refresh_scope_symbols(scope: str) -> list[str]:
+    scope_key = str(scope or "").strip().lower()
+    if scope_key == "portfolio + watchlist":
+        return _sidebar_universe_symbols(load_remote=False)
+    if scope_key == "portfolio + scanner universe":
+        symbols = _sidebar_universe_symbols(load_remote=_use_full_universe or _use_index_universe)
+        return symbols[:500]
+    return []
 
 # ── Pre-scan filters (shown when Full Market OR curated with >50 symbols) ────
 with st.sidebar.expander("⚡ Pre-scan Filters", expanded=(_use_full_universe or _use_index_universe)):
@@ -680,6 +742,57 @@ with st.sidebar.expander("Robinhood Portfolios", expanded=False):
         ),
     )
     st.caption("Dashboard reads local snapshots; Robinhood order execution still requires review.")
+    _rh_refresh_scope = st.radio(
+        "Refresh scope",
+        ["Portfolio only", "Portfolio + watchlist", "Portfolio + scanner universe"],
+        index=0,
+        key="sidebar_robinhood_refresh_scope",
+        help="Adds extra symbols to the Robinhood quote refresh beyond your current holdings.",
+    )
+    if st.button("Refresh Robinhood Snapshot", key="sidebar_refresh_robinhood_snapshot", use_container_width=True):
+        try:
+            with st.spinner("Refreshing Robinhood quotes and portfolios…"):
+                _extra_symbols = _robinhood_refresh_scope_symbols(_rh_refresh_scope)
+                result = refresh_snapshots(
+                    portfolios_path=robinhood_portfolios_path,
+                    quotes_path=robinhood_quote_path,
+                    extra_quote_symbols=_extra_symbols,
+                )
+            st.cache_data.clear()
+            for key in (
+                "rh_portfolio_rows",
+                "rh_portfolio_full",
+                "rh_portfolio_ts",
+                "scanner_results",
+                "scanner_ts",
+                "options_results",
+                "options_ts",
+                "patterns_results",
+                "patterns_ts",
+            ):
+                st.session_state.pop(key, None)
+            st.session_state["_rh_rescore_after_refresh"] = True
+            st.success(
+                f"Robinhood snapshot refreshed: {', '.join(result.account_labels) or 'accounts updated'} "
+                f"· {len(result.quote_symbols)} symbols"
+            )
+            if _extra_symbols:
+                st.caption(
+                    f"Included {min(len(_extra_symbols), len(result.quote_symbols))} extra symbol"
+                    f"{'' if len(_extra_symbols) == 1 else 's'} from {_rh_refresh_scope.lower()}."
+                )
+            st.info("Robinhood snapshot refreshed. Holdings will be re-scored automatically on the next page render.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Robinhood snapshot refresh failed: {exc}")
+    _snapshot_ttl = max(30, int(os.environ.get("ROBINHOOD_SNAPSHOT_TTL_SEC", "300") or 300))
+    _quotes_fresh, _quotes_status = _sidebar_snapshot_file_status(robinhood_quote_path, ttl_seconds=_snapshot_ttl)
+    _portfolios_fresh, _portfolios_status = _sidebar_snapshot_file_status(robinhood_portfolios_path, ttl_seconds=_snapshot_ttl)
+    _overall_fresh = _quotes_fresh and _portfolios_fresh
+    st.caption(
+        f"{'🟢' if _overall_fresh else '🟡'} Quotes: {_quotes_status} · "
+        f"Portfolios: {_portfolios_status} · TTL {_snapshot_ttl}s"
+    )
 
 st.sidebar.markdown("---")
 _autorefresh_on = st.sidebar.checkbox("🔁 Auto-refresh", value=True,
@@ -1132,6 +1245,19 @@ def get_all(records: list[dict], *event_types: str) -> list[dict]:
     return [r for r in records if r.get("event_type") in event_types]
 
 
+def get_recent_payloads(records: list[dict], event_type: str, limit: int = 25) -> list[dict]:
+    out: list[dict] = []
+    for record in reversed(records):
+        if record.get("event_type") != event_type:
+            continue
+        payload = record.get("payload", {})
+        if isinstance(payload, dict):
+            out.append(payload)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def parse_ts(ts: str) -> datetime:
     try:
         dt = datetime.fromisoformat(ts)
@@ -1154,6 +1280,42 @@ def relative_time(ts: str) -> str:
         return "—"
 
 
+def _snapshot_file_status(path: str, ttl_seconds: int | None = None) -> tuple[bool, str]:
+    if not path:
+        return False, "missing"
+    p = Path(path)
+    if not p.exists():
+        return False, "missing"
+    try:
+        ttl = max(30, int(ttl_seconds or os.environ.get("ROBINHOOD_SNAPSHOT_TTL_SEC", "300") or 300))
+    except ValueError:
+        ttl = 300
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    updated_at = ""
+    if isinstance(payload, dict):
+        updated_at = str(payload.get("updated_at") or "")
+    try:
+        age = (
+            max(0.0, (datetime.now(timezone.utc) - parse_ts(updated_at)).total_seconds())
+            if updated_at
+            else max(0.0, time.time() - p.stat().st_mtime)
+        )
+        fresh = age <= ttl
+        if age < 60:
+            age_label = f"{age:.0f}s"
+        elif age < 3600:
+            age_label = f"{age / 60:.1f}m"
+        else:
+            age_label = f"{age / 3600:.1f}h"
+        state = "fresh" if fresh else "stale"
+        return fresh, f"{state} · {age_label}"
+    except Exception:
+        return False, "unavailable"
+
+
 def safe_float(val, default: float = 0.0) -> float:
     try:
         return float(val)
@@ -1168,6 +1330,14 @@ def fmt_money(v: float) -> str:
     if abs(v) >= 1_000:
         return f"${v/1_000:+.2f}K" if v != abs(v) else f"${v/1_000:.2f}K"
     return f"${v:+.2f}" if v != abs(v) else f"${v:.2f}"
+
+
+def safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _latest_price_dict(latest, *, requested_feed: str, fallback_from: str = "") -> dict:
@@ -1199,31 +1369,45 @@ def _robinhood_quote_to_latest(quote: dict) -> dict | None:
     symbol = str(quote.get("symbol") or "").upper()
     if not symbol:
         return None
+    ext_price = safe_float(quote.get("last_extended_hours_trade_price"), 0.0)
     last_price = safe_float(quote.get("last_trade_price"), 0.0)
     non_reg_price = safe_float(quote.get("last_non_reg_trade_price"), 0.0)
+    ext_time = str(
+        quote.get("updated_at")
+        or quote.get("last_extended_hours_trade_time")
+        or quote.get("venue_last_extended_hours_trade_time")
+        or ""
+    )
     last_time = str(quote.get("venue_last_trade_time") or "")
     non_reg_time = str(quote.get("venue_last_non_reg_trade_time") or "")
-    use_non_reg = False
-    if non_reg_price > 0 and non_reg_time:
-        if not last_time:
-            use_non_reg = True
-        else:
-            use_non_reg = parse_ts(non_reg_time) > parse_ts(last_time)
-    price = non_reg_price if use_non_reg else last_price
-    timestamp = non_reg_time if use_non_reg else last_time
+    candidates: list[tuple[str, float, str, str]] = []
+    if ext_price > 0:
+        candidates.append(("extended", ext_price, ext_time, "quote_last_extended_hours"))
+    if non_reg_price > 0:
+        candidates.append(("non_regular", non_reg_price, non_reg_time, "quote_last_non_regular"))
+    if last_price > 0:
+        candidates.append(("regular", last_price, last_time, "quote_last_trade"))
+    if not candidates:
+        return None
+    ranked = sorted(
+        candidates,
+        key=lambda item: (parse_ts(item[2]).timestamp() if item[2] else float("-inf"), item[1]),
+        reverse=True,
+    )
+    session, price, timestamp, source = ranked[0]
     if price <= 0:
         return None
     age = _quote_time_age_seconds(timestamp)
     return {
         "price": price,
-        "source": "quote_last_non_regular" if use_non_reg else "quote_last_trade",
+        "source": source,
         "feed": "robinhood",
         "timestamp": timestamp,
         "bid": safe_float(quote.get("bid_price"), 0.0),
         "ask": safe_float(quote.get("ask_price"), 0.0),
         "age_seconds": age if age is not None else 999999.0,
         "stale": bool(age is None or age > 60),
-        "session": "non_regular" if use_non_reg else "regular",
+        "session": session,
         "state": str(quote.get("state") or ""),
         "has_traded": quote.get("has_traded"),
         "requested_feed": "robinhood",
@@ -1266,6 +1450,20 @@ def load_robinhood_quote_snapshot(path: str) -> dict[str, dict]:
         return out
     except Exception:
         return {}
+
+
+def _robinhood_snapshot_fresh(path: str, ttl_seconds: int | None = None) -> bool:
+    """Return True when the local Robinhood quote snapshot is fresh enough to trust."""
+    if not path:
+        return False
+    ttl = ttl_seconds
+    if ttl is None:
+        try:
+            ttl = max(30, int(os.environ.get("ROBINHOOD_SNAPSHOT_TTL_SEC", "300") or 300))
+        except ValueError:
+            ttl = 300
+    status = _snapshot_status(path, ttl)
+    return bool(status.get("fresh"))
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -1332,7 +1530,7 @@ def load_latest_price_map(symbols: tuple[str, ...]) -> dict[str, dict]:
         preferred_feed = os.environ.get("BOT_MARKET_DATA_FEED", "auto")
     latest = _load_latest_price_map_cached(symbols, str(preferred_feed or "auto").lower())
     rh_path = str(globals().get("robinhood_quote_path", "") or "")
-    if rh_path:
+    if rh_path and _robinhood_snapshot_fresh(rh_path):
         rh_quotes = load_robinhood_quote_snapshot(rh_path)
         for symbol in symbols:
             quote = rh_quotes.get(symbol.upper())
@@ -1438,6 +1636,24 @@ def data_confidence(latest: dict) -> tuple[str, int, str]:
     return "LOW", score, ", ".join(reasons)
 
 
+def robinhood_quote_confirmation(symbol: str, latest: dict | None = None) -> tuple[str, str]:
+    symbol_u = str(symbol or "").upper()
+    if not symbol_u:
+        return "UNKNOWN", "No symbol"
+    rh_latest = _robinhood_latest_price_map((symbol_u,)).get(symbol_u, {})
+    if rh_latest and not rh_latest.get("stale"):
+        return "CONFIRMED", (
+            f"Fresh Robinhood quote confirmed at {format_price_time(str(rh_latest.get('timestamp') or ''))}"
+        )
+    latest = latest or {}
+    if latest and not latest.get("error"):
+        source = latest_source_label(latest, "market data")
+        if latest.get("stale"):
+            return "REVIEW", f"Robinhood quote unavailable; fallback source {source} is stale."
+        return "FALLBACK", f"Robinhood quote unavailable; using current fallback source {source}."
+    return "MISSING", "No fresh Robinhood quote or fallback latest price available."
+
+
 def _obj_get(item: Any, key: str, default: Any = None) -> Any:
     if isinstance(item, dict):
         return item.get(key, default)
@@ -1517,11 +1733,13 @@ def _normalize_robinhood_portfolio_account(raw: dict, default_key: str = "") -> 
     account_masked = str(data.get("account_masked") or data.get("account_last4") or "").strip()
     if not account_masked:
         account_masked = _mask_account_number(account_number)
+    features = data.get("features") if isinstance(data.get("features"), dict) else {}
     return {
         "id": f"{label}:{account_masked}",
         "label": label,
         "account": account_masked,
         "agentic": agentic,
+        "features": features,
         "portfolio": portfolio,
         "positions": positions,
         "updated_at": str(data.get("updated_at") or raw.get("updated_at") or ""),
@@ -1582,12 +1800,28 @@ def _portfolio_buying_power(portfolio: dict) -> float:
 
 def _robinhood_latest_price_map(symbols: tuple[str, ...]) -> dict[str, dict]:
     rh_path = str(globals().get("robinhood_quote_path", "") or os.environ.get("ROBINHOOD_QUOTES_PATH", ""))
-    quotes = load_robinhood_quote_snapshot(rh_path) if rh_path else {}
+    quotes = load_robinhood_quote_snapshot(rh_path) if rh_path and _robinhood_snapshot_fresh(rh_path) else {}
     return {
         symbol.upper(): quotes[symbol.upper()]
         for symbol in symbols
         if symbol and symbol.upper() in quotes
     }
+
+
+def _robinhood_snapshot_symbols(include_crypto: bool = False) -> list[str]:
+    path = str(globals().get("robinhood_portfolios_path", "") or os.environ.get("ROBINHOOD_PORTFOLIOS_PATH", "logs/robinhood_portfolios.json"))
+    accounts = load_robinhood_portfolio_snapshot(path)
+    symbols: list[str] = []
+    for account in accounts:
+        for holding in account.get("positions", []):
+            symbol = str(holding.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            if not include_crypto and str(holding.get("type") or "").lower() == "crypto":
+                continue
+            if symbol not in symbols:
+                symbols.append(symbol)
+    return symbols
 
 
 def _robinhood_price_for_holding(holding: dict, latest: dict) -> tuple[float, float, float, float]:
@@ -1628,6 +1862,22 @@ def _robinhood_equity_pnl(accounts: list[dict]) -> dict[str, float]:
         "pnl": pnl,
         "pnl_pct": pnl_pct,
     }
+
+
+def _portfolio_net_invested(account: dict) -> float:
+    portfolio = account.get("portfolio", {}) if isinstance(account.get("portfolio"), dict) else {}
+    equity_cost = 0.0
+    crypto_cost = 0.0
+    for holding in account.get("positions", []):
+        qty = safe_float(holding.get("shares"), 0.0)
+        avg_cost = safe_float(holding.get("avg_cost"), 0.0)
+        basis = qty * avg_cost
+        if str(holding.get("type") or "").lower() == "crypto":
+            crypto_cost += basis
+        else:
+            equity_cost += basis
+    cash = _portfolio_metric(portfolio, "cash")
+    return equity_cost + crypto_cost + cash
 
 
 def _snapshot_status(path: str, ttl_seconds: int = 300) -> dict[str, Any]:
@@ -2355,29 +2605,49 @@ def _recommend_robinhood_holdings(accounts: list[dict], horizon: str) -> tuple[l
     full: list[dict] = []
     for holding in holdings:
         symbol = str(holding.get("symbol", "")).upper()
+        latest = latest_map.get(symbol, {})
+        latest_px = safe_float(latest.get("price"), 0.0)
+        shares = safe_float(holding.get("shares"), 0.0)
+        avg_cost = safe_float(holding.get("avg_cost"), 0.0)
+        holding_type = str(holding.get("type") or "").lower()
         result = scan_by_symbol.get(symbol)
         if result is None:
+            fallback_market_value = safe_float(holding.get("market_value"), 0.0)
+            if latest_px > 0 and shares > 0:
+                fallback_market_value = shares * latest_px
+            fallback_cost_basis = shares * avg_cost
+            fallback_pnl = fallback_market_value - fallback_cost_basis if fallback_market_value and fallback_cost_basis else 0.0
+            fallback_pnl_pct = (fallback_pnl / fallback_cost_basis * 100.0) if fallback_cost_basis > 0 else 0.0
+            if holding_type == "crypto":
+                why = "Crypto holding uses Robinhood quote data here, but the stock scanner does not generate a technical score for crypto yet."
+            elif latest_px > 0:
+                why = "Live quote is available, but no technical bars were returned for scoring."
+            else:
+                why = "No market data returned for this holding."
             rows.append({
                 "Account": holding.get("_account_label", "Robinhood"),
                 "Symbol": symbol,
                 "Action": "—",
                 "Suggested": "No action",
-                "Why": "No market data returned for this holding.",
-                "Shares": safe_float(holding.get("shares"), 0.0),
+                "Why": why,
+                "Shares": shares,
                 "Sellable": safe_float(holding.get("sellable"), 0.0),
-                "Avg Cost": safe_float(holding.get("avg_cost"), 0.0),
-                "Price": None,
-                "Market Value": safe_float(holding.get("market_value"), 0.0),
-                "P&L $": None,
-                "P&L %": None,
+                "Avg Cost": avg_cost,
+                "Price": round(latest_px, 2) if latest_px > 0 else None,
+                "Price Time": format_price_time(str(latest.get("timestamp") or "")),
+                "Source": latest_source_label(latest, "robinhood snapshot") if latest else "unavailable",
+                "Robinhood Check": "QUOTE ONLY" if latest_px > 0 else "NO DATA",
+                "Market Value": round(fallback_market_value, 2),
+                "P&L $": round(fallback_pnl, 2),
+                "P&L %": round(fallback_pnl_pct, 2),
                 "Score": None,
             })
             continue
-        latest = latest_map.get(symbol, {})
         latest_px = latest.get("price")
         if latest_px:
             result.close = float(latest_px)
             holding["market_value"] = safe_float(holding.get("shares"), 0.0) * float(latest_px)
+        rh_check, rh_check_note = robinhood_quote_confirmation(symbol, latest)
         rec = advise_position(
             symbol,
             safe_float(holding.get("shares"), 0.0),
@@ -2391,6 +2661,8 @@ def _recommend_robinhood_holdings(accounts: list[dict], horizon: str) -> tuple[l
         rec["sellable"] = safe_float(holding.get("sellable"), 0.0)
         rec["latest_time"] = format_price_time(str(latest.get("timestamp") or ""))
         rec["latest_source"] = latest_source_label(latest, "scan")
+        rec["rh_check"] = rh_check
+        rec["rh_check_note"] = rh_check_note
         full.append(rec)
         rows.append({
             "Account": rec["account"],
@@ -2404,6 +2676,7 @@ def _recommend_robinhood_holdings(accounts: list[dict], horizon: str) -> tuple[l
             "Price": round(rec["price"], 2),
             "Price Time": rec["latest_time"],
             "Source": rec["latest_source"],
+            "Robinhood Check": rh_check,
             "Market Value": round(rec["market_value"], 2),
             "P&L $": round(rec["total_return"], 2),
             "P&L %": round(rec["pnl_pct"], 2),
@@ -2454,15 +2727,23 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
     total_equity = sum(_portfolio_metric(a.get("portfolio", {}), "equity_value") for a in accounts)
     total_cash = sum(_portfolio_metric(a.get("portfolio", {}), "cash") for a in accounts)
     total_bp = sum(_portfolio_buying_power(a.get("portfolio", {})) for a in accounts)
+    total_options = sum(_portfolio_metric(a.get("portfolio", {}), "options_value") for a in accounts)
+    total_crypto = sum(_portfolio_metric(a.get("portfolio", {}), "crypto_value") for a in accounts)
     equity_pnl = _robinhood_equity_pnl(accounts)
+    total_net_invested = sum(_portfolio_net_invested(a) for a in accounts)
     holdings_count = sum(len(a.get("positions", [])) for a in accounts)
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Accounts", len(accounts))
-    c2.metric("Account Value", fmt_money(total_value))
-    c3.metric("Equities", fmt_money(total_equity))
-    c4.metric("Total P/L", f"${equity_pnl['pnl']:+,.2f}", f"{equity_pnl['pnl_pct']:+.2f}%")
-    c5.metric("Cash", fmt_money(total_cash))
-    c6.metric("Buying Power", fmt_money(total_bp))
+    top_metrics_1 = st.columns(5)
+    top_metrics_1[0].metric("Accounts", len(accounts))
+    top_metrics_1[1].metric("Account Value", fmt_money(total_value))
+    top_metrics_1[2].metric("Net Invested", fmt_money(total_net_invested))
+    top_metrics_1[3].metric("Total P/L", f"${equity_pnl['pnl']:+,.2f}", f"{equity_pnl['pnl_pct']:+.2f}%")
+    top_metrics_1[4].metric("Buying Power", fmt_money(total_bp))
+
+    top_metrics_2 = st.columns(4)
+    top_metrics_2[0].metric("Equities", fmt_money(total_equity))
+    top_metrics_2[1].metric("Cash", fmt_money(total_cash))
+    top_metrics_2[2].metric("Options", fmt_money(total_options))
+    top_metrics_2[3].metric("Crypto", fmt_money(total_crypto))
     all_symbols = tuple(dict.fromkeys(
         str(h.get("symbol", "")).upper()
         for account in accounts
@@ -2476,13 +2757,13 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
             if safe_float(latest.get("age_seconds"), 999999.0) <= 300
         )
         st.caption(
-            f"Using Robinhood quote snapshot for {len(rh_latest_all):,}/{len(all_symbols):,} holdings "
+            f"Using fresh Robinhood quotes for {len(rh_latest_all):,}/{len(all_symbols):,} holdings "
             f"({fresh_count:,} fresh within 5 minutes)."
         )
     elif all_symbols:
         st.warning(
-            "No Robinhood quote snapshot is loaded, so recommendation scoring may fall back to Alpaca/yfinance prices. "
-            "Refresh `logs/robinhood_quotes.json` to make Robinhood quotes the price source."
+            "Fresh Robinhood quotes are not available, so recommendation scoring is using current Alpaca/yfinance prices "
+            "instead of stale snapshot data. Refresh `logs/robinhood_quotes.json` to restore Robinhood as the preferred price source."
         )
 
     rec_rows = st.session_state.get("rh_portfolio_rows", [])
@@ -2492,12 +2773,16 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
         portfolio = account.get("portfolio", {})
         positions = account.get("positions", [])
         account_pnl = _robinhood_equity_pnl([account])
+        net_invested = _portfolio_net_invested(account)
         account_summary_rows.append({
             "Account": account.get("label", "Robinhood"),
             "ID": account.get("account", "—"),
             "Role": "Agentic" if account.get("agentic") else "Investing",
             "Value": fmt_money(_portfolio_metric(portfolio, "total_value", "portfolio_value")),
+            "Net Invested": fmt_money(net_invested),
             "Equities": fmt_money(_portfolio_metric(portfolio, "equity_value")),
+            "Options": fmt_money(_portfolio_metric(portfolio, "options_value")),
+            "Crypto": fmt_money(_portfolio_metric(portfolio, "crypto_value")),
             "Total P/L": f"${account_pnl['pnl']:+,.2f}",
             "P/L %": f"{account_pnl['pnl_pct']:+.2f}%",
             "Cash": fmt_money(_portfolio_metric(portfolio, "cash")),
@@ -2509,11 +2794,31 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
     for row in rec_rows:
         rec_by_account.setdefault(str(row.get("Account", "")), []).append(row)
 
-    overview_tab, actions_tab, holdings_tab, detail_tab = st.tabs(
-        ["Overview", "Actions", "Holdings", "Position Detail"]
+    overview_tab, actions_tab, holdings_tab, features_tab, detail_tab = st.tabs(
+        ["Overview", "Actions", "Holdings", "Capabilities", "Position Detail"]
     )
 
     with overview_tab:
+        summary_cards = st.columns(max(1, min(3, len(account_summary_rows))))
+        for col, row in zip(summary_cards, account_summary_rows):
+            with col:
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid rgba(148,163,184,0.22);border-radius:8px;padding:0.9rem 1rem;
+                                background:rgba(15,23,42,0.26);min-height:170px">
+                      <div style="color:#94a3b8;font-size:0.78rem;text-transform:uppercase">{row['Role']}</div>
+                      <div style="color:#f8fafc;font-size:1.15rem;font-weight:700;margin-top:0.15rem">{row['Account']}</div>
+                      <div style="color:#94a3b8;font-size:0.82rem">{row['ID']}</div>
+                      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.55rem;margin-top:0.8rem">
+                        <div><div style="color:#94a3b8;font-size:0.72rem">Value</div><div style="color:#e2e8f0">{row['Value']}</div></div>
+                        <div><div style="color:#94a3b8;font-size:0.72rem">Net Invested</div><div style="color:#e2e8f0">{row['Net Invested']}</div></div>
+                        <div><div style="color:#94a3b8;font-size:0.72rem">P/L</div><div style="color:#e2e8f0">{row['Total P/L']} ({row['P/L %']})</div></div>
+                        <div><div style="color:#94a3b8;font-size:0.72rem">Cash</div><div style="color:#e2e8f0">{row['Cash']}</div></div>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
         st.dataframe(pd.DataFrame(account_summary_rows), use_container_width=True, hide_index=True)
         st.caption(f"Snapshot: `{path}`")
         controls_l, controls_r = st.columns([2, 1])
@@ -2572,11 +2877,16 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
         for tab, account in zip(account_tabs, accounts):
             with tab:
                 portfolio = account.get("portfolio", {})
-                p1, p2, p3, p4 = st.columns(4)
-                p1.metric("Value", fmt_money(_portfolio_metric(portfolio, "total_value", "portfolio_value")))
-                p2.metric("Equity Value", fmt_money(_portfolio_metric(portfolio, "equity_value")))
-                p3.metric("Cash", fmt_money(_portfolio_metric(portfolio, "cash")))
-                p4.metric("Buying Power", fmt_money(_portfolio_buying_power(portfolio)))
+                p_top = st.columns(4)
+                p_top[0].metric("Value", fmt_money(_portfolio_metric(portfolio, "total_value", "portfolio_value")))
+                p_top[1].metric("Net Invested", fmt_money(_portfolio_net_invested(account)))
+                p_top[2].metric("Equity Value", fmt_money(_portfolio_metric(portfolio, "equity_value")))
+                p_top[3].metric("Buying Power", fmt_money(_portfolio_buying_power(portfolio)))
+
+                p_bottom = st.columns(3)
+                p_bottom[0].metric("Cash", fmt_money(_portfolio_metric(portfolio, "cash")))
+                p_bottom[1].metric("Options", fmt_money(_portfolio_metric(portfolio, "options_value")))
+                p_bottom[2].metric("Crypto", fmt_money(_portfolio_metric(portfolio, "crypto_value")))
 
                 account_rows = rec_by_account.get(str(account.get("label", "")), [])
                 if account_rows:
@@ -2612,6 +2922,54 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
                 st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
                 st.caption("Score portfolios to add buy/hold/trim/sell actions and reasons.")
 
+    with features_tab:
+        feature_rows = []
+        ipo_notes: list[str] = []
+        crypto_rows: list[dict] = []
+        for account in accounts:
+            features = account.get("features", {}) if isinstance(account.get("features"), dict) else {}
+            feature_rows.append({
+                "Account": account.get("label", "Robinhood"),
+                "Role": "Agentic" if account.get("agentic") else "Investing",
+                "Account Type": str(features.get("account_type") or "—"),
+                "Option Level": str(features.get("option_level") or "—"),
+                "Fractionals": "Yes" if safe_bool(features.get("eligible_for_fractionals")) else "No",
+                "DRIP Enabled": "Yes" if safe_bool(features.get("drip_enabled")) else "No",
+                "Cash Mgmt": "Yes" if safe_bool(features.get("cash_management_enabled")) else "No",
+                "Agentic Allowed": "Yes" if safe_bool(features.get("agentic_allowed")) else "No",
+                "Crypto BP": fmt_money(safe_float(features.get("crypto_buying_power"), 0.0)),
+                "Options BP": fmt_money(safe_float(features.get("options_buying_power"), 0.0)),
+                "IPO Restricted": "Yes" if safe_bool(features.get("ipo_access_restricted")) else "No",
+                "IPO Restriction Reason": str(features.get("ipo_access_restricted_reason") or "—"),
+                "State": str(features.get("state") or "—"),
+            })
+            if safe_bool(features.get("ipo_access_restricted")):
+                ipo_notes.append(
+                    f"{account.get('label', 'Robinhood')}: {str(features.get('ipo_access_restricted_reason') or 'IPO access restricted')}"
+                )
+            for pos in account.get("positions", []):
+                if str(pos.get("type") or "").lower() != "crypto":
+                    continue
+                crypto_rows.append({
+                    "Account": account.get("label", "Robinhood"),
+                    "Symbol": str(pos.get("symbol") or ""),
+                    "Quantity": round(safe_float(pos.get("shares"), 0.0), 8),
+                    "Avg Cost": round(safe_float(pos.get("avg_cost"), 0.0), 4),
+                    "Market Value": round(safe_float(pos.get("market_value"), 0.0), 2),
+                })
+        st.dataframe(pd.DataFrame(feature_rows), use_container_width=True, hide_index=True)
+        st.caption("These capability flags come from the Robinhood account snapshot and help explain what each account can actually do.")
+        if ipo_notes:
+            for note in ipo_notes:
+                st.warning(note)
+        else:
+            st.success("No IPO access restrictions are currently flagged in the Robinhood account snapshot.")
+        if crypto_rows:
+            st.markdown("**Crypto Holdings**")
+            st.dataframe(pd.DataFrame(crypto_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No crypto positions are present in the current Robinhood snapshot.")
+
     with detail_tab:
         if not full_recs:
             st.info("Run scoring first, then pick any holding here to inspect the rationale.")
@@ -2627,6 +2985,39 @@ def _render_robinhood_portfolios_panel(path: str) -> None:
             d2.metric("RSI", f"{rec['rsi']:.0f}")
             d3.metric("5-day Momentum", f"{rec['momentum']:+.2f}%")
             d4.metric("P&L", f"${rec['total_return']:+,.2f}", f"{rec['pnl_pct']:+.2f}%")
+            _holding_spec = ResearchPromptSpec(
+                subject=str(rec.get("symbol", "")).upper(),
+                goals=st.session_state.get("research_goals", "long-term capital appreciation"),
+                risk_tolerance=st.session_state.get("research_risk", "moderate"),
+                time_horizon=st.session_state.get("research_horizon", "5+ years"),
+                as_of_date=st.session_state.get(
+                    "research_as_of_date",
+                    datetime.now(app_timezone()).strftime("%B %d, %Y"),
+                ),
+            )
+            _holding_mode = st.session_state.get("research_mode", "memo")
+            with st.expander("Research packet", expanded=False):
+                st.text_area(
+                    "Holding prompt",
+                    value=build_prompt_for_mode(_holding_mode, _holding_spec),
+                    height=320,
+                    key=f"holding_research_prompt_{rec['symbol']}",
+                )
+                if st.button("Save Holding Research Packet", key=f"holding_research_save_{rec['symbol']}"):
+                    _queue_research_packet_event(
+                        journal_path=journal_path,
+                        spec=_holding_spec,
+                        mode=_holding_mode,
+                        source="robinhood_holding",
+                        context={
+                            "account": str(rec.get("account", "")),
+                            "symbol": str(rec.get("symbol", "")).upper(),
+                            "action": str(rec.get("action", "")),
+                            "score": safe_float(rec.get("score", 0.0), 0.0),
+                            "pnl_pct": safe_float(rec.get("pnl_pct", 0.0), 0.0),
+                        },
+                    )
+                    st.success(f"Saved research packet for {rec['symbol']}.")
 
 
 def _manual_order_ticket(symbol: str, result: Any, latest: dict, records: list[dict]) -> dict:
@@ -2700,6 +3091,24 @@ def _notify_dashboard_event(event_type: str, message: str, payload: dict) -> boo
         return Notifier(settings.webhook_url, settings.notify_events).notify(event_type, message, payload)
     except Exception:
         return False
+
+
+def _queue_research_packet_event(
+    *,
+    journal_path: str,
+    spec: ResearchPromptSpec,
+    mode: str,
+    source: str,
+    context: dict | None = None,
+) -> dict:
+    packet = build_research_packet(
+        spec=spec,
+        mode=mode,
+        source=source,
+        context=context or {},
+    )
+    _record_dashboard_event(journal_path, "research_packet", packet)
+    return packet
 
 
 def _paper_performance(records: list[dict]) -> tuple[list[dict], dict]:
@@ -3162,8 +3571,9 @@ else:
     st.error("LIVE TRADING MODE ACTIVE. Confirm every real Robinhood order before submission.")
 if _market_data_feed != "sip":
     st.info(
-        "Execution/portfolio prices prefer Robinhood quote snapshots. Technical indicators still use historical bars "
-        "from Alpaca/yfinance until a Robinhood historical-feed client is added."
+        "Execution and portfolio prices prefer fresh Robinhood quote snapshots. When Robinhood quotes are stale or "
+        "missing, the dashboard falls back to current Alpaca/yfinance data instead of showing old prices. "
+        "Technical indicators still use historical bars from Alpaca/yfinance until a Robinhood historical-feed client is added."
     )
 c1, c2 = st.columns([3, 1])
 with c1:
@@ -3192,7 +3602,20 @@ if active_key == "portfolio":
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     orders_today = [r for r in orders_all if parse_ts(r.get("ts", "")) >= today_start]
     _rh_portfolios_path = str(globals().get("robinhood_portfolios_path", "") or "logs/robinhood_portfolios.json")
+    _rh_quotes_path = str(globals().get("robinhood_quote_path", "") or "logs/robinhood_quotes.json")
     _rh_accounts_for_metrics = load_robinhood_portfolio_snapshot(_rh_portfolios_path)
+    if st.session_state.pop("_rh_rescore_after_refresh", False) and _rh_accounts_for_metrics:
+        _horizon_label = str(st.session_state.get("rh_portfolio_horizon", "Short-term") or "Short-term")
+        _horizon = "long" if _horizon_label == "Long-term" else "short"
+        try:
+            _rows, _full = _recommend_robinhood_holdings(_rh_accounts_for_metrics, _horizon)
+            st.session_state["rh_portfolio_rows"] = _rows
+            st.session_state["rh_portfolio_full"] = _full
+            st.session_state["rh_portfolio_ts"] = format_local_now("%I:%M:%S %p %Z")
+            st.success("Robinhood holdings were re-scored from the refreshed snapshot.")
+        except Exception as exc:
+            st.warning(f"Snapshot refreshed, but automatic portfolio re-score failed: {exc}")
+    _render_snapshot_status_panel(_rh_portfolios_path, _rh_quotes_path)
 
     # Metrics row
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -3287,7 +3710,7 @@ elif active_key == "scanner":
             "EOD mode: scores symbols on **MA crossover** (30%), **5-day momentum** (25%), "
             "**RSI oversold** (20%), **volume surge** (15%), **trend consistency** (10%)."
         )
-    st.caption("Technical scoring uses Alpaca/yfinance historical bars; displayed prices prefer Robinhood quote snapshots.")
+    st.caption("Technical scoring uses Alpaca/yfinance historical bars; displayed prices prefer fresh Robinhood quotes and fall back to current market data when Robinhood snapshots are stale.")
     scan_cmd_1, scan_cmd_2 = st.columns([1, 3])
     with scan_cmd_1:
         page_run_scan = st.button("Run Buy Scanner", type="primary", key="scanner_run_page", use_container_width=True)
@@ -3571,6 +3994,8 @@ elif active_key == "scanner":
                 row["Price Source"] = latest_source_label(latest, row.get("Price Source", ""))
                 conf_label, conf_score, _conf_reason = data_confidence(latest)
                 row["Data Confidence"] = f"{conf_label} ({conf_score})"
+            rh_check, _rh_note = robinhood_quote_confirmation(symbol, latest)
+            row["Robinhood Check"] = rh_check
 
         # Pagination nav
         if total_pages > 1:
@@ -3643,6 +4068,7 @@ elif active_key == "scanner":
                         st.info("Select a symbol from the current scan results.")
                     else:
                         conf_label, conf_score, conf_reason = data_confidence(selected_latest)
+                        rh_check, rh_note = robinhood_quote_confirmation(selected_symbol, selected_latest)
                         ticket = _manual_order_ticket(selected_symbol.upper(), selected_result, selected_latest, records)
                         e1, e2, e3, e4, e5 = st.columns(5)
                         e1.metric("Score", f"{safe_float(_obj_get(selected_result, 'score'), 0.0):.1f}")
@@ -3651,11 +4077,23 @@ elif active_key == "scanner":
                         e4.metric("Latest", f"${ticket['latest_price']:.2f}" if ticket["latest_price"] else "—")
                         e5.metric("Est. Upside", f"+{safe_float(_obj_get(selected_result, 'upside_pct'), 0.0):.1f}%")
 
-                        explain_tab, ticket_tab = st.tabs(["Explain", "Robinhood Ticket"])
+                        _research_spec_selected = ResearchPromptSpec(
+                            subject=selected_symbol.upper(),
+                            goals=st.session_state.get("research_goals", "long-term capital appreciation"),
+                            risk_tolerance=st.session_state.get("research_risk", "moderate"),
+                            time_horizon=st.session_state.get("research_horizon", "5+ years"),
+                            as_of_date=st.session_state.get(
+                                "research_as_of_date",
+                                datetime.now(app_timezone()).strftime("%B %d, %Y"),
+                            ),
+                        )
+                        _research_mode_selected = st.session_state.get("research_mode", "memo")
+                        explain_tab, research_tab, ticket_tab = st.tabs(["Explain", "Research Prompt", "Robinhood Ticket"])
                         with explain_tab:
                             st.markdown(f"**Plain English:** {explain_buy(selected_result)}")
                             st.markdown(f"**Top driver:** {_obj_get(selected_result, 'top_driver', '—')}")
                             st.markdown(f"**Full reason:** {_obj_get(selected_result, 'reason', '—')}")
+                            st.markdown(f"**Robinhood quote check:** {rh_check} — {rh_note}")
                             st.markdown(
                                 f"**Quality gate:** {'PASS' if bool(_obj_get(selected_result, 'quality_pass', True)) else 'BLOCK'} "
                                 f"({_quality_flags_text(_obj_get(selected_result, 'quality_flags', 'ok'))})"
@@ -3672,6 +4110,32 @@ elif active_key == "scanner":
                                 ["Avg dollar volume", f"${safe_float(_obj_get(selected_result, 'avg_dollar_vol_m'), 0.0):.1f}M"],
                             ], columns=["Metric", "Value"])
                             st.dataframe(detail_df, use_container_width=True, hide_index=True)
+                        with research_tab:
+                            _scan_prompt = build_prompt_for_mode(_research_mode_selected, _research_spec_selected)
+                            st.caption(
+                                f"Prompt mode: **{str(_research_mode_selected).upper()}** · goals **{_research_spec_selected.goals}** · "
+                                f"risk **{_research_spec_selected.risk_tolerance}** · horizon **{_research_spec_selected.time_horizon}**"
+                            )
+                            st.text_area(
+                                "Prompt",
+                                value=_scan_prompt,
+                                height=360,
+                                key=f"scanner_research_prompt_{selected_symbol}",
+                            )
+                            if st.button("Save Research Packet", key=f"scanner_research_save_{selected_symbol}"):
+                                _queue_research_packet_event(
+                                    journal_path=journal_path,
+                                    spec=_research_spec_selected,
+                                    mode=_research_mode_selected,
+                                    source="scanner_detail",
+                                    context={
+                                        "symbol": selected_symbol.upper(),
+                                        "signal": str(_obj_get(selected_result, "signal", "")),
+                                        "score": safe_float(_obj_get(selected_result, "score", 0.0), 0.0),
+                                        "top_driver": str(_obj_get(selected_result, "top_driver", "") or ""),
+                                    },
+                                )
+                                st.success(f"Saved research packet for {selected_symbol.upper()}.")
                         with ticket_tab:
                             st.code(
                                 "\n".join([
@@ -4367,6 +4831,7 @@ elif active_key == "advisor":
                     latest_px = latest.get("price")
                     latest_time = format_price_time(str(latest.get("timestamp") or ""))
                     latest_conf, latest_conf_score, latest_conf_reason = data_confidence(latest)
+                    rh_check, rh_check_note = robinhood_quote_confirmation(adv_symbol, latest)
                     if latest_px:
                         scan_out[0].close = float(latest_px)
                     rec = advise_position(adv_symbol, adv_shares, adv_avg_cost, scan_out[0], market_value=adv_market_value, horizon=_adv_horizon_key)
@@ -4383,7 +4848,8 @@ elif active_key == "advisor":
                           </div>
                           <div style="color:#94a3b8;font-size:0.85em;margin-top:3px">
                             Latest price timestamp: <b>{latest_time}</b> &nbsp;·&nbsp;
-                            Data confidence <b>{latest_conf} ({latest_conf_score})</b>
+                            Data confidence <b>{latest_conf} ({latest_conf_score})</b> &nbsp;·&nbsp;
+                            Robinhood check <b>{rh_check}</b>
                           </div>
                           <div style="color:#e2e8f0;font-size:1.05em;margin-top:4px">
                             Market value <b>${rec['market_value']:,.2f}</b> &nbsp;·&nbsp;
@@ -4412,6 +4878,7 @@ elif active_key == "advisor":
                     mc4b.metric("Est. Upside", f"+{scan_out[0].upside_pct:.1f}%" if scan_out[0].upside_pct > 0 else "—")
                     st.caption(f"💡 Bot driver: **{rec['driver']}**")
                     st.caption(f"Data confidence reason: {latest_conf_reason}")
+                    st.caption(f"Robinhood quote confirmation: {rh_check_note}")
 
     with _adv_tab_csv:
         st.markdown(
@@ -4626,13 +5093,38 @@ elif active_key == "patterns":
     )
     st.caption("Runs all pattern detectors + the regime-aware ensemble across your watchlist.")
 
+    _rh_pattern_symbols = _robinhood_snapshot_symbols(include_crypto=False)
+    _pa_source = st.radio(
+        "Symbol source",
+        ["Robinhood holdings", "Manual list"],
+        horizontal=True,
+        key="patterns_symbol_source",
+    )
+    if _pa_source == "Robinhood holdings":
+        if _rh_pattern_symbols:
+            _pa_default_symbols = ",".join(_rh_pattern_symbols)
+        else:
+            _pa_default_symbols = _env_symbols or _DEFAULT_WATCHLIST
+            st.warning("No Robinhood holdings snapshot symbols are available yet, so the Patterns page is falling back to the manual/default list.")
+    else:
+        _pa_default_symbols = _env_symbols or _DEFAULT_WATCHLIST
+    st.caption("Robinhood watchlist import is not implemented yet; Robinhood holdings are the available broker-linked source today.")
+
     _pa_symbols_raw = st.text_area(
         "Symbols (comma-separated)",
-        value=_env_symbols or _DEFAULT_WATCHLIST,
+        value=_pa_default_symbols,
         height=80,
+        key="patterns_symbols_raw",
     )
-    _pa_symbols = [s.strip().upper() for s in _pa_symbols_raw.split(",") if s.strip()][:120]
-    _pa_period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
+    _pa_all_symbols = [s.strip().upper() for s in _pa_symbols_raw.split(",") if s.strip()]
+    _pa_limit_col1, _pa_limit_col2 = st.columns([1, 1])
+    with _pa_limit_col1:
+        _pa_symbol_limit = st.number_input("Max symbols", 10, 500, 120, 10)
+    with _pa_limit_col2:
+        _pa_period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
+    _pa_symbols = _pa_all_symbols[: int(_pa_symbol_limit)]
+    if len(_pa_all_symbols) > len(_pa_symbols):
+        st.warning(f"Pattern scan is currently using the first {len(_pa_symbols)} of {len(_pa_all_symbols)} symbols.")
     _pa_col1, _pa_col2 = st.columns([2, 1])
     with _pa_col1:
         _pa_run = st.button("▶ Run pattern scan", type="primary")
@@ -4719,9 +5211,26 @@ elif active_key == "options":
     st.caption("Scan option chains for the best risk-adjusted strategy candidates. "
                "Powered by Alpaca options API (fallback: yfinance).")
 
+    _rh_option_symbols = _robinhood_snapshot_symbols(include_crypto=False)
+    _ol_source_mode = st.radio(
+        "Underlying source",
+        ["Robinhood holdings", "Manual list"],
+        horizontal=True,
+        key="options_symbol_source",
+    )
+    if _ol_source_mode == "Robinhood holdings":
+        if _rh_option_symbols:
+            _ol_default_symbols = ",".join(_rh_option_symbols)
+        else:
+            _ol_default_symbols = "SPY,QQQ,AAPL,NVDA"
+            st.warning("No Robinhood holdings snapshot symbols are available yet, so Options is falling back to the manual/default list.")
+    else:
+        _ol_default_symbols = "SPY,QQQ,AAPL,NVDA"
+    st.caption("Robinhood watchlist import is not implemented yet; Robinhood holdings are the available broker-linked source today.")
+
     _ol_col1, _ol_col2, _ol_col3, _ol_col4 = st.columns([3, 2, 2, 2])
     with _ol_col1:
-        _ol_underlying_raw = st.text_input("Underlyings (comma-separated)", value="SPY,QQQ,AAPL,NVDA")
+        _ol_underlying_raw = st.text_input("Underlyings (comma-separated)", value=_ol_default_symbols, key="options_underlyings_raw")
     with _ol_col2:
         _ol_strategies = st.multiselect(
             "Strategies",
@@ -4737,18 +5246,21 @@ elif active_key == "options":
         _ol_delta = st.slider("Target Δ (abs)", 0.05, 0.50, 0.30, 0.05)
         _ol_width = st.number_input("Spread width ($)", 1.0, 50.0, 5.0, 1.0)
 
-    _ol_col5, _ol_col6, _ol_col7 = st.columns([2, 2, 3])
+    _ol_col5, _ol_col6, _ol_col7, _ol_col8 = st.columns([2, 2, 2, 3])
     with _ol_col5:
         _ol_source = st.selectbox("Data source", ["auto", "alpaca", "yfinance"])
     with _ol_col6:
         _ol_top = st.number_input("Top N results", 5, 100, 15)
     with _ol_col7:
+        _ol_per_strategy_top = st.number_input("Per-strategy cap", 1, 20, 2)
+    with _ol_col8:
+        _ol_symbol_limit = st.number_input("Max underlyings", 5, 200, 40)
         _ol_run = st.button("▶ Run options scan", type="primary")
 
     @st.cache_data(ttl=120, show_spinner="Fetching chains & scoring strategies…")
     def _options_scan_cached(symbols: tuple[str, ...], strategies: tuple[str, ...],
                               min_dte: int, max_dte: int, delta: float, width: float,
-                              source: str, top_n: int) -> list[dict]:
+                              source: str, top_n: int, per_strategy_top: int) -> list[dict]:
         from ai_trading.options.scanner import scan_options
         results = scan_options(
             underlyings=list(symbols),
@@ -4756,7 +5268,7 @@ elif active_key == "options":
             use_equity_scanner=False,
             strategies=list(strategies),
             top_n=top_n,
-            per_strategy_top=2,
+            per_strategy_top=per_strategy_top,
             min_dte=min_dte,
             max_dte=max_dte,
             target_delta=delta,
@@ -4770,13 +5282,16 @@ elif active_key == "options":
         if not _ol_strategies:
             st.warning("Pick at least one strategy.")
         else:
-            symbols = tuple(s.strip().upper() for s in _ol_underlying_raw.split(",") if s.strip())[:40]
+            all_symbols = tuple(s.strip().upper() for s in _ol_underlying_raw.split(",") if s.strip())
+            symbols = all_symbols[: int(_ol_symbol_limit)]
+            if len(all_symbols) > len(symbols):
+                st.warning(f"Options scan is currently using the first {len(symbols)} of {len(all_symbols)} underlyings.")
             try:
                 results = _options_scan_cached(
                     symbols, tuple(_ol_strategies),
                     int(_ol_min_dte), int(_ol_max_dte),
                     float(_ol_delta), float(_ol_width),
-                    _ol_source, int(_ol_top),
+                    _ol_source, int(_ol_top), int(_ol_per_strategy_top),
                 )
                 st.session_state["options_results"] = results
                 st.session_state["options_ts"] = format_local_now("%I:%M:%S %p %Z")
@@ -4896,6 +5411,182 @@ elif active_key == "options":
             st.caption("No open option positions.")
     except Exception as exc:
         st.caption(f"(could not load option positions: {exc})")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Research page
+# ─────────────────────────────────────────────────────────────────────────────
+elif active_key == "research":
+    _render_page_header(
+        "Research",
+        "Generate institutional-style equity research prompts for deep dives, earnings reviews, valuation work, and balanced bull-vs-bear debates.",
+        ["Prompt builder", "Robinhood-linked symbols", "Manual analysis workflow"],
+    )
+    st.caption(
+        "This page builds structured prompts for external AI or manual analysis. "
+        "It does not fetch filings or generate the memo by itself."
+    )
+    _recent_packets = get_recent_payloads(records, "research_packet", limit=20)
+    if _recent_packets:
+        _packet_labels = [
+            f"{str(p.get('subject', '—')).upper()} · {str(p.get('mode', 'memo')).upper()} · {str(p.get('source', 'manual'))}"
+            for p in _recent_packets
+        ]
+        _packet_pick = st.selectbox(
+            "Recent saved packets",
+            options=["Start fresh"] + _packet_labels,
+            index=0,
+            key="research_recent_packet_pick",
+        )
+        if _packet_pick != "Start fresh":
+            _picked = _recent_packets[_packet_labels.index(_packet_pick)]
+            st.caption(
+                f"Loaded saved packet context from **{str(_picked.get('source', 'manual'))}** for "
+                f"**{str(_picked.get('subject', '')).upper()}**."
+            )
+            st.session_state["research_mode"] = str(_picked.get("mode", "memo"))
+            st.session_state["research_goals"] = str(_picked.get("goals", "long-term capital appreciation"))
+            st.session_state["research_risk"] = str(_picked.get("risk_tolerance", "moderate"))
+            st.session_state["research_horizon"] = str(_picked.get("time_horizon", "5+ years"))
+            st.session_state["research_as_of_date"] = str(
+                _picked.get("as_of_date", datetime.now(app_timezone()).strftime("%B %d, %Y"))
+            )
+
+    _rh_research_symbols = _robinhood_snapshot_symbols(include_crypto=True)
+    _research_source = st.radio(
+        "Coverage source",
+        ["Robinhood holdings", "Manual entry"],
+        horizontal=True,
+        key="research_symbol_source",
+    )
+    _manual_default = (_env_symbols.split(",")[0].strip().upper() if _env_symbols else "") or "NVDA"
+    if _research_source == "Robinhood holdings" and _rh_research_symbols:
+        _research_default_subject = _rh_research_symbols[0]
+    else:
+        _research_default_subject = _manual_default
+        if _research_source == "Robinhood holdings":
+            st.warning("No Robinhood holdings snapshot symbols are available yet, so Research is falling back to manual entry.")
+
+    _res_col1, _res_col2, _res_col3 = st.columns([2.2, 1.3, 1.5])
+    with _res_col1:
+        if _research_source == "Robinhood holdings" and _rh_research_symbols:
+            _research_subject = st.selectbox(
+                "Primary ticker / company",
+                options=_rh_research_symbols,
+                index=0,
+                key="research_subject_select",
+            )
+        else:
+            _research_subject = st.text_input(
+                "Primary ticker / company",
+                value=_research_default_subject,
+                key="research_subject_manual",
+            ).strip().upper()
+    with _res_col2:
+        _research_mode = st.selectbox(
+            "Prompt type",
+            ["memo", "earnings", "valuation", "debate"],
+            index=0,
+            key="research_mode",
+        )
+    with _res_col3:
+        _research_as_of = st.text_input(
+            "As-of date",
+            value=datetime.now(app_timezone()).strftime("%B %d, %Y"),
+            key="research_as_of_date",
+        ).strip()
+
+    _res_col4, _res_col5, _res_col6 = st.columns([1.6, 1.2, 1.2])
+    with _res_col4:
+        _research_goals = st.text_input(
+            "Investment goals",
+            value="long-term capital appreciation",
+            key="research_goals",
+        ).strip()
+    with _res_col5:
+        _research_risk = st.selectbox(
+            "Risk tolerance",
+            ["low", "moderate", "moderate-high", "high"],
+            index=1,
+            key="research_risk",
+        )
+    with _res_col6:
+        _research_horizon = st.selectbox(
+            "Time horizon",
+            ["1 year", "3 years", "5+ years", "10+ years"],
+            index=2,
+            key="research_horizon",
+        )
+
+    _comparison_candidates = [s for s in _rh_research_symbols if s != _research_subject]
+    _comparison_mode = st.checkbox(
+        "Add comparison target",
+        value=False,
+        key="research_compare_on",
+        help="Used by the full investment memo prompt.",
+    )
+    _comparison_target = ""
+    if _comparison_mode:
+        if _research_source == "Robinhood holdings" and _comparison_candidates:
+            _comparison_target = st.selectbox(
+                "Comparison ticker",
+                options=[""] + _comparison_candidates,
+                index=0,
+                key="research_compare_select",
+            )
+        else:
+            _comparison_target = st.text_input(
+                "Comparison ticker",
+                value="",
+                key="research_compare_manual",
+            ).strip().upper()
+
+    _research_spec = ResearchPromptSpec(
+        subject=_research_subject or _research_default_subject,
+        goals=_research_goals or "long-term capital appreciation",
+        risk_tolerance=_research_risk,
+        time_horizon=_research_horizon,
+        as_of_date=_research_as_of or datetime.now(app_timezone()).strftime("%B %d, %Y"),
+        comparison_target=_comparison_target,
+    )
+
+    if _research_mode == "earnings":
+        _research_prompt = build_earnings_prompt(_research_spec)
+    elif _research_mode == "valuation":
+        _research_prompt = build_valuation_prompt(_research_spec)
+    elif _research_mode == "debate":
+        _research_prompt = build_debate_prompt(_research_spec)
+    else:
+        _research_prompt = build_investment_memo_prompt(_research_spec)
+
+    _research_meta_1, _research_meta_2, _research_meta_3, _research_meta_4 = st.columns(4)
+    _research_meta_1.metric("Prompt Type", _research_mode.upper())
+    _research_meta_2.metric("Subject", _research_spec.subject or "—")
+    _research_meta_3.metric("Comparison", _research_spec.comparison_target or "—")
+    _research_meta_4.metric("Length", f"{len(_research_prompt.split()):,} words")
+
+    st.text_area(
+        "Generated prompt",
+        value=_research_prompt,
+        height=680,
+        key="research_prompt_output",
+    )
+    _save_col, _meta_col = st.columns([1.2, 3.0])
+    with _save_col:
+        if st.button("Save Packet To Journal", key="research_save_packet_page", type="primary", use_container_width=True):
+            _queue_research_packet_event(
+                journal_path=journal_path,
+                spec=_research_spec,
+                mode=_research_mode,
+                source="research_page",
+                context={"comparison": _research_spec.comparison_target},
+            )
+            st.success(f"Saved research packet for {_research_spec.subject}.")
+    with _meta_col:
+        st.caption("Saved packets appear here and can also be created from scanner detail or Robinhood holding detail views.")
+    st.caption(
+        "Use this with your preferred research workflow. The memo prompt is the full institutional template; "
+        "earnings, valuation, and debate are narrower follow-up lenses."
+    )
 
 # ── Auto-refresh (non-blocking) ──
 # Use a client-side timer so the Python script does not sleep and block render.

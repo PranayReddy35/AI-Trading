@@ -279,6 +279,21 @@ class Settings:
     options_slippage_pct: float = 0.0
     options_allow_naked: bool = False
     options_dry_run: bool = True             # safe default: log, don't submit
+    research_auto_queue: bool = False
+    research_queue_limit: int = 5
+    research_mode: str = "memo"
+    research_goals: str = "long-term capital appreciation"
+    research_risk_tolerance: str = "moderate"
+    research_time_horizon: str = "5+ years"
+    robinhood_refresh_on_open: bool = True
+    robinhood_rotation_enabled: bool = False
+    robinhood_rotation_buy_limit: int = 2
+    robinhood_rotation_min_buy_score: float = 65.0
+    robinhood_rotation_trim_score_max: float = 45.0
+    robinhood_rotation_exit_score_max: float = 35.0
+    robinhood_execution_mode: str = "intent_only"
+    robinhood_auto_approve: bool = False
+    robinhood_auto_dispatch: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -429,6 +444,21 @@ class Settings:
             options_slippage_pct=float(os.getenv("BOT_OPTIONS_SLIPPAGE_PCT", "0")),
             options_allow_naked=os.getenv("BOT_OPTIONS_ALLOW_NAKED", "false").lower() == "true",
             options_dry_run=os.getenv("BOT_OPTIONS_DRY_RUN", "true").lower() == "true",
+            research_auto_queue=os.getenv("BOT_RESEARCH_AUTO_QUEUE", "false").lower() == "true",
+            research_queue_limit=max(1, int(os.getenv("BOT_RESEARCH_QUEUE_LIMIT", "5"))),
+            research_mode=os.getenv("BOT_RESEARCH_MODE", "memo").lower(),
+            research_goals=os.getenv("BOT_RESEARCH_GOALS", "long-term capital appreciation"),
+            research_risk_tolerance=os.getenv("BOT_RESEARCH_RISK_TOLERANCE", "moderate"),
+            research_time_horizon=os.getenv("BOT_RESEARCH_TIME_HORIZON", "5+ years"),
+            robinhood_refresh_on_open=os.getenv("ROBINHOOD_REFRESH_ON_OPEN", "true").lower() == "true",
+            robinhood_rotation_enabled=os.getenv("ROBINHOOD_ROTATION_ENABLED", "false").lower() == "true",
+            robinhood_rotation_buy_limit=max(0, int(os.getenv("ROBINHOOD_ROTATION_BUY_LIMIT", "2"))),
+            robinhood_rotation_min_buy_score=float(os.getenv("ROBINHOOD_ROTATION_MIN_BUY_SCORE", "65")),
+            robinhood_rotation_trim_score_max=float(os.getenv("ROBINHOOD_ROTATION_TRIM_SCORE_MAX", "45")),
+            robinhood_rotation_exit_score_max=float(os.getenv("ROBINHOOD_ROTATION_EXIT_SCORE_MAX", "35")),
+            robinhood_execution_mode=os.getenv("ROBINHOOD_EXECUTION_MODE", "intent_only").lower(),
+            robinhood_auto_approve=os.getenv("ROBINHOOD_AUTO_APPROVE", "false").lower() == "true",
+            robinhood_auto_dispatch=os.getenv("ROBINHOOD_AUTO_DISPATCH", "false").lower() == "true",
         )
 
     def validate(self) -> None:
@@ -446,11 +476,15 @@ class Settings:
                     "Set ROBINHOOD_AGENTIC_BUYING_POWER and ROBINHOOD_AGENTIC_EQUITY "
                     "from a fresh Robinhood portfolio check before BOT_BROKER=robinhood."
                 )
-            if not self.stock_dry_run:
+            if self.robinhood_execution_mode not in {"intent_only", "approval_queue", "auto_dispatch"}:
+                raise ValueError("ROBINHOOD_EXECUTION_MODE must be intent_only, approval_queue, or auto_dispatch.")
+            if not self.stock_dry_run and self.robinhood_execution_mode == "intent_only":
                 raise ValueError(
-                    "BOT_STOCK_DRY_RUN must be true for BOT_BROKER=robinhood until "
-                    "a local Robinhood MCP execution client is implemented."
+                    "BOT_STOCK_DRY_RUN must be true for BOT_BROKER=robinhood when "
+                    "ROBINHOOD_EXECUTION_MODE=intent_only."
                 )
+            if self.robinhood_auto_dispatch and self.robinhood_execution_mode != "auto_dispatch":
+                raise ValueError("ROBINHOOD_AUTO_DISPATCH requires ROBINHOOD_EXECUTION_MODE=auto_dispatch.")
             if self.robinhood_use_dollar_orders:
                 if self.robinhood_dollar_amount_per_trade <= 0:
                     raise ValueError("ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE must be > 0 when dollar orders are enabled.")

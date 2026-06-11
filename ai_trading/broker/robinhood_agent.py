@@ -9,6 +9,7 @@ from typing import Any
 
 from ai_trading.broker.alpaca_broker import AlpacaBroker
 from ai_trading.broker.robinhood_health import mask_account_number
+from ai_trading.broker.robinhood_snapshot import load_fresh_robinhood_quotes
 
 
 logger = logging.getLogger("ai_trading")
@@ -56,11 +57,23 @@ class RobinhoodAgenticBroker:
 
     def get_latest_price(self, symbol: str) -> float:
         """Return latest market-data price while Robinhood execution stays intent-only."""
-        return self._market.get_latest_price(symbol)
+        prices = self.get_latest_prices([symbol])
+        return float(prices.get(symbol.upper()) or self._market.get_latest_price(symbol))
 
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
         """Return latest market-data prices while Robinhood execution stays intent-only."""
-        return self._market.get_latest_prices(symbols)
+        clean = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+        robinhood_quotes = load_fresh_robinhood_quotes()
+        out = {
+            symbol: robinhood_quotes[symbol]
+            for symbol in clean
+            if symbol in robinhood_quotes
+        }
+        missing = [symbol for symbol in clean if symbol not in out]
+        if missing:
+            fallback = self._market.get_latest_prices(missing)
+            out.update({str(symbol).upper(): float(price) for symbol, price in fallback.items() if float(price) > 0})
+        return out
 
     def account_state(self) -> dict:
         return {

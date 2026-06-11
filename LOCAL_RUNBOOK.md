@@ -171,8 +171,47 @@ Useful dashboard pages:
 - `Buy Scanner`: scan for buy candidates.
 - `Sell Scanner`: scan holdings/watchlist for trim or exit candidates.
 - `Position Advisor`: manually evaluate one symbol or uploaded holdings.
+- `Research`: build memo, earnings, valuation, and bull-vs-bear prompts from holdings or manual tickers.
 
 Stop the dashboard with `Control-C` in the Terminal running Streamlit.
+
+## 6A. Deploy the Dashboard to Streamlit Community Cloud
+
+Use Streamlit Community Cloud for the dashboard UI only.
+
+Important:
+
+- The dashboard deploys well on Streamlit Cloud.
+- The trading bot is not a reliable fit for Streamlit Cloud as an always-on worker.
+- Keep the bot running locally, on a VPS, cron, GitHub Actions, Railway, Render, or another worker process.
+
+Before deploying:
+
+1. Push this repo to GitHub.
+2. In Streamlit Community Cloud, create a new app from this repo.
+3. Set the main file path to:
+
+```text
+ai_trading/dashboard.py
+```
+
+4. In the Streamlit app settings, open `Secrets`.
+5. Copy the contents of:
+
+```text
+.streamlit/secrets.example.toml
+```
+
+6. Paste them into the Streamlit Secrets editor.
+7. Replace placeholder values with your real keys and settings.
+
+Recommended deployment notes:
+
+- Do not paste your local `.env` file directly into git.
+- Do not commit `.streamlit/secrets.toml`.
+- Keep `BOT_STOCK_DRY_RUN=true` until you have verified the deployed dashboard behavior.
+- For Streamlit-hosted dashboards, local file paths like `logs/robinhood_quotes.json` only work if the app itself generates or ships those files in its runtime environment.
+- Robinhood refreshes that depend on your local machine or local snapshots will not magically sync into Streamlit Cloud unless the deployed app can generate them there too.
 
 ## 7. Run the Bot Once
 
@@ -192,6 +231,13 @@ With Robinhood dry-run mode, the bot writes order intents to:
 
 ```text
 logs/robinhood_order_intents.jsonl
+```
+
+If you are using the newer guarded Robinhood execution flow instead of pure dry-run,
+the bot may also create approval records in:
+
+```text
+logs/robinhood_approvals.jsonl
 ```
 
 Inspect the latest Robinhood intent:
@@ -254,6 +300,118 @@ When AI/Codex credits are exhausted, the local app cannot ask the chat Robinhood
 3. Keep using Alpaca/yfinance scanner data for technical indicators, while Robinhood snapshots are used only when available for portfolio prices.
 
 The dashboard will clearly label missing or stale Robinhood snapshots.
+
+You can now refresh those files locally with:
+
+```bash
+python -m ai_trading.broker.robinhood_snapshot
+```
+
+Or:
+
+```bash
+make robinhood-refresh
+```
+
+You can also refresh Robinhood snapshots directly inside the dashboard:
+
+1. Open the sidebar.
+2. Expand `Robinhood Portfolios`.
+3. Choose a `Refresh scope`:
+   - `Portfolio only`
+   - `Portfolio + watchlist`
+   - `Portfolio + scanner universe`
+4. Click `Refresh Robinhood Snapshot`.
+
+After a successful refresh, the dashboard now:
+
+- clears stale snapshot-backed cached tables
+- automatically re-scores Robinhood holdings on the next page render
+- updates the Portfolio action rows without needing a second manual `Score Portfolios` click
+
+The sidebar and Portfolio page both show Robinhood snapshot freshness and age.
+
+To keep Robinhood snapshots updating automatically in the background:
+
+```bash
+python -m ai_trading.broker.robinhood_snapshot --loop --interval-sec 60
+```
+
+Or:
+
+```bash
+make robinhood-refresh-loop
+```
+
+Build a research prompt locally:
+
+```bash
+make research-prompt TICKER=NVDA MODE=memo
+```
+
+Or use the dashboard's **Research** page to generate memo, earnings, valuation, and bull-vs-bear prompts using Robinhood holdings or manual symbols.
+
+Required local env vars for this command:
+
+```dotenv
+ROBINHOOD_USERNAME=your_login_email
+ROBINHOOD_PASSWORD=your_login_password
+ROBINHOOD_AGENTIC_ACCOUNT_NUMBER=your_account_number
+```
+
+Optional:
+
+```dotenv
+ROBINHOOD_MFA_CODE=
+ROBINHOOD_DEVICE_TOKEN=
+ROBINHOOD_QUOTE_SYMBOLS=SPY,QQQ
+ROBINHOOD_ACCOUNT_NUMBERS=
+```
+
+`ROBINHOOD_QUOTE_SYMBOLS` lets you keep extra names refreshed even when they are not current holdings.
+`ROBINHOOD_ACCOUNT_NUMBERS` lets you include additional Robinhood account numbers in the combined snapshot when needed.
+
+### Robinhood market-open automation
+
+Optional Robinhood automation settings:
+
+```dotenv
+ROBINHOOD_REFRESH_ON_OPEN=true
+ROBINHOOD_ROTATION_ENABLED=true
+ROBINHOOD_ROTATION_BUY_LIMIT=2
+ROBINHOOD_ROTATION_MIN_BUY_SCORE=65
+ROBINHOOD_ROTATION_TRIM_SCORE_MAX=45
+ROBINHOOD_ROTATION_EXIT_SCORE_MAX=35
+```
+
+Robinhood execution modes:
+
+```dotenv
+# safest
+ROBINHOOD_EXECUTION_MODE=intent_only
+BOT_STOCK_DRY_RUN=true
+
+# auto-create approvals, but do not dispatch them
+ROBINHOOD_EXECUTION_MODE=approval_queue
+BOT_STOCK_DRY_RUN=false
+ROBINHOOD_AUTO_APPROVE=true
+ROBINHOOD_AUTO_DISPATCH=false
+
+# auto-create and dispatch approvals to your executor webhook
+ROBINHOOD_EXECUTION_MODE=auto_dispatch
+BOT_STOCK_DRY_RUN=false
+ROBINHOOD_AUTO_APPROVE=true
+ROBINHOOD_AUTO_DISPATCH=true
+ROBINHOOD_EXECUTOR_WEBHOOK_URL=https://your-executor-endpoint
+```
+
+What this Robinhood automation does:
+
+- refreshes Robinhood snapshots at bot start
+- scores current holdings for hold/trim/sell rotation
+- scores replacement buy candidates from your configured symbol universe
+- writes a `robinhood_rotation_plan` into the journal
+- optionally creates and dispatches Robinhood approval records through the guarded executor flow
 
 ## 11. Discord Alerts
 
@@ -369,7 +527,30 @@ python -m streamlit run ai_trading/dashboard.py --server.port 8501 --server.addr
 
 ### Dashboard shows stale Robinhood prices
 
-That means `logs/robinhood_quotes.json` is old or missing. Refresh the snapshot through your available Robinhood data path, then click `Refresh Dashboard Snapshot Cache`.
+That means `logs/robinhood_quotes.json` is old, missing, or the current scored table was built before the latest quote refresh.
+
+Use one of these:
+
+```bash
+make robinhood-refresh
+```
+
+or use the dashboard sidebar:
+
+1. Expand `Robinhood Portfolios`
+2. Click `Refresh Robinhood Snapshot`
+
+The dashboard will now auto re-score Robinhood holdings after a successful refresh. If a scanner table still looks old, re-run that specific scanner page.
+
+### Dashboard says `No market data returned for this holding`
+
+This usually means one of these:
+
+- the holding is crypto (`BTC`, `ETH`, `DOGE`, etc.), and the stock technical scanner does not produce a score for crypto
+- Robinhood quote data is available, but no technical bars were returned for that symbol
+- the symbol is missing from both Robinhood quote refresh coverage and the fallback market-data path
+
+The dashboard now shows quote-backed fallback rows when it can, but unsupported holdings may still appear as quote-only instead of fully scored.
 
 ### Bot is not creating Robinhood intents
 

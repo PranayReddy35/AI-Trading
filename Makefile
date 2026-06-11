@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := $(PYTHON) -m pip
 STREAMLIT := $(PYTHON) -m streamlit
 
-.PHONY: setup install test health robinhood-health robinhood-intent robinhood-intent-with-quote robinhood-approvals robinhood-executor-payload dashboard bot scanner
+.PHONY: setup install test health robinhood-health robinhood-refresh robinhood-refresh-loop robinhood-intent robinhood-intent-with-quote robinhood-approvals robinhood-executor-payload dashboard bot scanner research-prompt
 
 setup:
 	python3 -m venv .venv
@@ -20,6 +20,12 @@ health:
 
 robinhood-health:
 	$(PYTHON) -m ai_trading.broker.robinhood_health
+
+robinhood-refresh:
+	$(PYTHON) -m ai_trading.broker.robinhood_snapshot
+
+robinhood-refresh-loop:
+	$(PYTHON) -m ai_trading.broker.robinhood_snapshot --loop
 
 robinhood-intent:
 	$(PYTHON) -m ai_trading.broker.robinhood_intents latest
@@ -41,3 +47,6 @@ bot:
 
 scanner:
 	$(PYTHON) -m ai_trading.scanner --symbols SPY,QQQ,AAPL --top 10
+
+research-prompt:
+	$(PYTHON) -m ai_trading.research --ticker "$(TICKER)" --mode "$(MODE)"

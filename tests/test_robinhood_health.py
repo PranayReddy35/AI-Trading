@@ -79,6 +79,38 @@ def test_create_broker_returns_robinhood_agentic_broker(monkeypatch) -> None:
     assert broker.account_state()["broker"] == "robinhood"
 
 
+def test_robinhood_agentic_broker_prefers_fresh_snapshot_quotes(monkeypatch) -> None:
+    class FakeAlpacaBroker:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_latest_prices(self, symbols):
+            return {symbol: 999.0 for symbol in symbols}
+
+        def get_latest_price(self, symbol):
+            return 999.0
+
+    monkeypatch.setattr("ai_trading.broker.robinhood_agent.AlpacaBroker", FakeAlpacaBroker)
+    monkeypatch.setattr(
+        "ai_trading.broker.robinhood_agent.load_fresh_robinhood_quotes",
+        lambda: {"SPY": 501.25},
+    )
+
+    broker = RobinhoodAgenticBroker(
+        account_number="593473374",
+        buying_power=100,
+        equity=100,
+        alpaca_api_key="alpaca-key",
+        alpaca_api_secret="alpaca-secret",
+        paper=True,
+    )
+
+    prices = broker.get_latest_prices(["SPY", "QQQ"])
+
+    assert prices["SPY"] == 501.25
+    assert prices["QQQ"] == 999.0
+
+
 def test_review_payload_maps_intent_to_mcp_args() -> None:
     payload = review_payload(
         {
@@ -141,6 +173,41 @@ def test_robinhood_dollar_orders_require_market_order() -> None:
     )
 
     with pytest.raises(ValueError, match="BOT_ORDER_TYPE=market"):
+        settings.validate()
+
+
+def test_robinhood_live_requires_non_intent_execution_mode_when_dry_run_off() -> None:
+    settings = Settings(
+        api_key="alpaca-key",
+        api_secret="alpaca-secret",
+        broker="robinhood",
+        robinhood_agentic_enabled=True,
+        robinhood_agentic_account_number="593473374",
+        robinhood_agentic_buying_power=100,
+        robinhood_agentic_equity=100,
+        stock_dry_run=False,
+        robinhood_execution_mode="intent_only",
+    )
+
+    with pytest.raises(ValueError, match="ROBINHOOD_EXECUTION_MODE=intent_only"):
+        settings.validate()
+
+
+def test_robinhood_auto_dispatch_requires_auto_dispatch_mode() -> None:
+    settings = Settings(
+        api_key="alpaca-key",
+        api_secret="alpaca-secret",
+        broker="robinhood",
+        robinhood_agentic_enabled=True,
+        robinhood_agentic_account_number="593473374",
+        robinhood_agentic_buying_power=100,
+        robinhood_agentic_equity=100,
+        stock_dry_run=False,
+        robinhood_execution_mode="approval_queue",
+        robinhood_auto_dispatch=True,
+    )
+
+    with pytest.raises(ValueError, match="ROBINHOOD_AUTO_DISPATCH"):
         settings.validate()
 
 

@@ -21,6 +21,7 @@ dependencies = [
   "joblib>=1.3.0",
   "vaderSentiment>=3.3.2",
   "streamlit>=1.30.0",
+  "robin-stocks>=3.4.0",
 ]
 
 [project.optional-dependencies]

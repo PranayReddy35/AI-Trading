@@ -472,6 +472,75 @@ The bot includes a full options stack under `ai_trading/options/`:
 | `integration.py` | Hook called from `bot.run_once` when `BOT_OPTIONS_ENABLED=true`           |
 | `runner.py`      | CLI: `scan`, `trade`, `positions`, `close`                                |
 
+Refresh local Robinhood dashboard snapshots:
+
+```bash
+python -m ai_trading.broker.robinhood_snapshot
+```
+
+This updates `logs/robinhood_portfolios.json` and `logs/robinhood_quotes.json` for the dashboard using local Robinhood credentials when available.
+
+Generate structured equity research prompts locally:
+
+```bash
+make research-prompt TICKER=NVDA MODE=memo
+```
+
+Supported `MODE` values:
+- `memo`
+- `earnings`
+- `valuation`
+- `debate`
+
+The Streamlit dashboard also includes a **Research** page that can build these prompts from Robinhood-held symbols, manual tickers, and your own goals/risk/time-horizon inputs.
+
+### Robinhood market-open automation
+
+You can now enable a guarded Robinhood market-open workflow:
+
+```bash
+export BOT_BROKER="robinhood"
+export ROBINHOOD_REFRESH_ON_OPEN="true"
+export ROBINHOOD_ROTATION_ENABLED="true"
+export ROBINHOOD_ROTATION_BUY_LIMIT="2"
+export ROBINHOOD_ROTATION_MIN_BUY_SCORE="65"
+export ROBINHOOD_ROTATION_TRIM_SCORE_MAX="45"
+export ROBINHOOD_ROTATION_EXIT_SCORE_MAX="35"
+```
+
+Execution modes:
+
+```bash
+# safest: generate intents only
+export ROBINHOOD_EXECUTION_MODE="intent_only"
+export BOT_STOCK_DRY_RUN="true"
+
+# queue executable approvals automatically, but do not dispatch
+export ROBINHOOD_EXECUTION_MODE="approval_queue"
+export BOT_STOCK_DRY_RUN="false"
+export ROBINHOOD_AUTO_APPROVE="true"
+
+# queue and dispatch approvals to an external Robinhood executor webhook
+export ROBINHOOD_EXECUTION_MODE="auto_dispatch"
+export BOT_STOCK_DRY_RUN="false"
+export ROBINHOOD_AUTO_APPROVE="true"
+export ROBINHOOD_AUTO_DISPATCH="true"
+export ROBINHOOD_EXECUTOR_WEBHOOK_URL="https://your-executor-endpoint"
+```
+
+What this does:
+- refreshes Robinhood snapshots at the start of a market-open bot cycle
+- scores current holdings for hold/trim/sell rotation decisions
+- scores candidate buys from your configured symbol universe
+- journals a `robinhood_rotation_plan`
+- optionally creates and dispatches Robinhood approval records for tightly rule-locked orders
+
+Keep snapshots refreshing automatically:
+
+```bash
+python -m ai_trading.broker.robinhood_snapshot --loop --interval-sec 60
+```
+
 ### Supported strategies
 
 | Strategy                 | Bias                       | Legs       | Risk                            |
@@ -722,6 +791,8 @@ Before going live with real money:
 
 The dashboard can be deployed for free on [Streamlit Community Cloud](https://share.streamlit.io/) so anyone with the link can access it.
 
+Important: Streamlit Community Cloud is a good home for the dashboard UI, but it is not a reliable always-on scheduler/worker for the trading bot. Use Streamlit Cloud for the dashboard, and run the bot separately on your own machine, a VPS, cron, GitHub Actions, Railway, Render, or another worker platform.
+
 ### Steps
 
 1. Push this repository to GitHub (public or private).
@@ -748,12 +819,29 @@ BOT_OTHER_WEBHOOK_URL = "YOUR_OTHER_ALERTS_WEBHOOK_URL"
 
 ROBINHOOD_AGENTIC_ENABLED = "true"
 ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "YOUR_AGENTIC_ACCOUNT_NUMBER"
+ROBINHOOD_AGENTIC_BUYING_POWER = "100"
+ROBINHOOD_AGENTIC_EQUITY = "100"
+ROBINHOOD_USERNAME = "YOUR_ROBINHOOD_LOGIN"
+ROBINHOOD_PASSWORD = "YOUR_ROBINHOOD_PASSWORD"
+ROBINHOOD_MFA_CODE = ""
+ROBINHOOD_DEVICE_TOKEN = ""
 ROBINHOOD_USE_DOLLAR_ORDERS = "true"
 ROBINHOOD_DOLLAR_AMOUNT_PER_TRADE = "25"
 ROBINHOOD_ORDER_INTENTS_PATH = "logs/robinhood_order_intents.jsonl"
+ROBINHOOD_APPROVALS_PATH = "logs/robinhood_approvals.jsonl"
+ROBINHOOD_QUOTE_SYMBOLS = "SPY,QQQ"
 ROBINHOOD_QUOTES_PATH = "logs/robinhood_quotes.json"
 ROBINHOOD_PORTFOLIOS_PATH = "logs/robinhood_portfolios.json"
 ROBINHOOD_SNAPSHOT_TTL_SEC = "300"
+ROBINHOOD_REFRESH_ON_OPEN = "true"
+ROBINHOOD_ROTATION_ENABLED = "true"
+ROBINHOOD_ROTATION_BUY_LIMIT = "2"
+ROBINHOOD_ROTATION_MIN_BUY_SCORE = "65"
+ROBINHOOD_ROTATION_TRIM_SCORE_MAX = "45"
+ROBINHOOD_ROTATION_EXIT_SCORE_MAX = "35"
+ROBINHOOD_EXECUTION_MODE = "approval_queue"
+ROBINHOOD_AUTO_APPROVE = "true"
+ROBINHOOD_AUTO_DISPATCH = "false"
 ```
 
 See `.streamlit/secrets.example.toml` for a longer copy/paste template.

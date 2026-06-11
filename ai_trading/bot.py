@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from datetime import datetime, timezone
 
 from ai_trading.broker.alpaca_broker import OrderError
+from ai_trading.broker.robinhood_approvals import approval_record, write_approval
 from ai_trading.broker.robinhood_agent import create_broker
+from ai_trading.broker.robinhood_executor import _dispatch_webhook
+from ai_trading.broker.robinhood_snapshot import refresh_snapshots
 from ai_trading.config import Settings
 from ai_trading.data.market_data import AlpacaMarketData
 from ai_trading.data.cache import BarCache
 from ai_trading.notifications.alerter import Notifier
+from ai_trading.research import ResearchPromptSpec, build_research_packet
 from ai_trading.risk.manager import RiskManager
 from ai_trading.risk.correlation import is_too_correlated
 from ai_trading.risk.correlation_scaling import correlation_scale
@@ -33,6 +39,325 @@ LIVE_WARNING = (
 PAPER_NOTICE = (
     "Paper trading mode. No real money at risk."
 )
+
+
+def _load_robinhood_accounts(path: str | Path) -> list[dict]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    accounts = payload.get("accounts", []) if isinstance(payload, dict) else []
+    return [a for a in accounts if isinstance(a, dict)]
+
+
+def _safe_num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _refresh_robinhood_snapshots_if_needed(settings: Settings, logger, journal: Journal) -> None:
+    if settings.broker != "robinhood" or not settings.robinhood_refresh_on_open:
+        return
+    try:
+        result = refresh_snapshots()
+        journal.write(
+            "robinhood_snapshot_refresh",
+            {
+                "portfolio_path": str(result.portfolio_path),
+                "quotes_path": str(result.quotes_path),
+                "account_labels": result.account_labels,
+                "quote_symbols": result.quote_symbols,
+            },
+        )
+        logger.info("Robinhood snapshots refreshed: %s", ", ".join(result.account_labels))
+    except Exception as exc:
+        logger.warning("Robinhood snapshot refresh failed: %s", exc)
+        journal.write("robinhood_snapshot_refresh_failed", {"reason": str(exc)})
+
+
+def _robinhood_approval_path() -> str:
+    return str(Path("logs/robinhood_approvals.jsonl"))
+
+
+def _dispatch_approval_if_configured(settings: Settings, path: str, record: dict, logger) -> None:
+    if not settings.robinhood_auto_dispatch:
+        return
+    import os
+
+    url = os.getenv("ROBINHOOD_EXECUTOR_WEBHOOK_URL", "").strip()
+    if not url:
+        logger.warning("ROBINHOOD_AUTO_DISPATCH enabled but ROBINHOOD_EXECUTOR_WEBHOOK_URL is missing.")
+        return
+    _dispatch_webhook(path, record, url)
+
+
+def _record_robinhood_approval(
+    *,
+    settings: Settings,
+    journal: Journal,
+    logger,
+    symbol: str,
+    action: str,
+    qty: int,
+    price: float,
+    reason: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+) -> dict:
+    payload = {
+        "symbol": symbol.upper(),
+        "action": action.upper(),
+        "quantity": qty,
+        "suggested_qty": qty,
+        "qty": qty,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "estimated_spend": round(price * qty, 2) if action.upper() == "BUY" else None,
+        "time_in_force": "gfd",
+        "market_hours": "regular_hours",
+        "reason": reason,
+    }
+    record = approval_record(
+        payload,
+        account_number=settings.robinhood_agentic_account_number,
+        dollar_amount_per_trade=settings.robinhood_dollar_amount_per_trade,
+        approved_by="bot_auto" if settings.robinhood_auto_approve else "bot_suggested",
+        status="approved_pending_execution" if settings.robinhood_auto_approve else "queued_for_review",
+    )
+    path = _robinhood_approval_path()
+    write_approval(path, record)
+    journal.write("robinhood_auto_approval", record)
+    logger.info("Robinhood approval queued: %s %s qty=%s", action.upper(), symbol.upper(), qty)
+    _dispatch_approval_if_configured(settings, path, record, logger)
+    return record
+
+
+def _maybe_execute_robinhood_rule_locked_order(
+    *,
+    settings: Settings,
+    journal: Journal,
+    notifier: Notifier,
+    logger,
+    symbol: str,
+    action: str,
+    qty: int,
+    price: float,
+    reason: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    latest_price=None,
+) -> bool:
+    if settings.broker != "robinhood":
+        return False
+    if settings.stock_dry_run:
+        return False
+    if settings.robinhood_execution_mode == "intent_only":
+        return False
+    _record_order_preview(
+        settings=settings,
+        journal=journal,
+        notifier=notifier,
+        payload=_order_preview_payload(
+            settings=settings,
+            symbol=symbol,
+            action=action,
+            qty=qty,
+            price=price,
+            reason=reason,
+            order_type=order_type,
+            limit_price=limit_price,
+            latest_price=latest_price,
+        ),
+    )
+    _record_robinhood_approval(
+        settings=settings,
+        journal=journal,
+        logger=logger,
+        symbol=symbol,
+        action=action,
+        qty=qty,
+        price=price,
+        reason=reason,
+        order_type=order_type,
+        limit_price=limit_price,
+    )
+    notifier.notify("trade", f"Robinhood {action} queued {qty} {symbol}", {"symbol": symbol, "action": action, "qty": qty, "reason": reason})
+    return True
+
+
+def _queue_research_packets_for_symbols(
+    *,
+    settings: Settings,
+    journal: Journal,
+    logger,
+    symbols: list[str],
+    source: str,
+) -> None:
+    if not settings.research_auto_queue:
+        return
+    mode = str(settings.research_mode or "memo").strip().lower()
+    queued = 0
+    seen: set[str] = set()
+    as_of_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        spec = ResearchPromptSpec(
+            subject=symbol,
+            goals=settings.research_goals,
+            risk_tolerance=settings.research_risk_tolerance,
+            time_horizon=settings.research_time_horizon,
+            as_of_date=as_of_date,
+        )
+        packet = build_research_packet(
+            spec=spec,
+            mode=mode,
+            source=source,
+            context={"origin": "bot", "symbol": symbol},
+        )
+        journal.write("research_packet", packet)
+        queued += 1
+        if queued >= settings.research_queue_limit:
+            break
+    if queued:
+        logger.info("Queued %d research packet(s) for %s", queued, source)
+
+
+def _build_robinhood_rotation_plan(settings: Settings, logger, journal: Journal) -> dict:
+    portfolios_path = Path(os.getenv("ROBINHOOD_PORTFOLIOS_PATH", "logs/robinhood_portfolios.json"))
+    if not portfolios_path.exists():
+        return {"holds": [], "sells": [], "buys": [], "reason": "no snapshot"}
+    accounts = _load_robinhood_accounts(portfolios_path)
+    positions: list[dict] = []
+    for account in accounts:
+        for pos in account.get("positions", []) or []:
+            if str(pos.get("type") or "").lower() == "crypto":
+                continue
+            symbol = str(pos.get("symbol") or "").upper()
+            qty = _safe_num(pos.get("quantity") or pos.get("shares"), 0.0)
+            if symbol and qty > 0:
+                positions.append({"symbol": symbol, "qty": qty, "account": account.get("label", "Robinhood")})
+    held_symbols = [p["symbol"] for p in positions]
+    if not held_symbols:
+        return {"holds": [], "sells": [], "buys": [], "reason": "no holdings"}
+
+    from ai_trading.scanner import scan, scan_live, is_market_open
+
+    market_open = is_market_open()
+    holding_results = scan_live(held_symbols, top_n=len(held_symbols)) if market_open else scan(held_symbols, top_n=len(held_symbols))
+    holding_map = {str(getattr(r, "symbol", "")).upper(): r for r in holding_results}
+
+    sells: list[dict] = []
+    holds: list[dict] = []
+    for pos in positions:
+        result = holding_map.get(pos["symbol"])
+        if result is None:
+            continue
+        score = _safe_num(getattr(result, "score", 0.0), 0.0)
+        signal = str(getattr(result, "signal", "HOLD") or "HOLD").upper()
+        row = {"symbol": pos["symbol"], "qty": pos["qty"], "score": score, "signal": signal}
+        if signal == "SELL" or score <= settings.robinhood_rotation_exit_score_max:
+            row["action"] = "SELL"
+            sells.append(row)
+        elif score <= settings.robinhood_rotation_trim_score_max:
+            row["action"] = "TRIM"
+            row["trim_qty"] = max(1, int(pos["qty"] * 0.5))
+            sells.append(row)
+        else:
+            row["action"] = "HOLD"
+            holds.append(row)
+
+    universe = settings.get_symbols()
+    candidates = [s for s in universe if s and s not in held_symbols]
+    buys: list[dict] = []
+    if candidates:
+        buy_results = scan_live(candidates, top_n=max(len(candidates), settings.robinhood_rotation_buy_limit)) if market_open else scan(candidates, top_n=max(len(candidates), settings.robinhood_rotation_buy_limit))
+        ranked = sorted(
+            [
+                {
+                    "symbol": str(getattr(r, "symbol", "")).upper(),
+                    "score": _safe_num(getattr(r, "score", 0.0), 0.0),
+                    "signal": str(getattr(r, "signal", "HOLD") or "HOLD").upper(),
+                    "price": _safe_num(getattr(r, "close", 0.0), 0.0),
+                }
+                for r in buy_results
+                if str(getattr(r, "signal", "HOLD") or "HOLD").upper() in {"BUY", "WATCH"}
+            ],
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+        buys = [
+            item for item in ranked
+            if item["score"] >= settings.robinhood_rotation_min_buy_score
+        ][: settings.robinhood_rotation_buy_limit]
+
+    plan = {"holds": holds, "sells": sells, "buys": buys}
+    journal.write("robinhood_rotation_plan", plan)
+    logger.info("Robinhood rotation plan: sells=%d buys=%d holds=%d", len(sells), len(buys), len(holds))
+    return plan
+
+
+def _run_robinhood_rotation_phase(
+    *,
+    settings: Settings,
+    broker,
+    journal: Journal,
+    notifier: Notifier,
+    logger,
+) -> None:
+    if settings.broker != "robinhood" or not settings.robinhood_rotation_enabled:
+        return
+    plan = _build_robinhood_rotation_plan(settings, logger, journal)
+    executed_sells = 0
+    for item in plan.get("sells", []):
+        symbol = str(item.get("symbol") or "").upper()
+        qty = int(item.get("trim_qty") or item.get("qty") or 0)
+        if not symbol or qty <= 0:
+            continue
+        price = float(broker.get_latest_price(symbol))
+        reason = f"rotation {str(item.get('action') or 'SELL').lower()} score={_safe_num(item.get('score'), 0.0):.1f}"
+        if _maybe_execute_robinhood_rule_locked_order(
+            settings=settings,
+            journal=journal,
+            notifier=notifier,
+            logger=logger,
+            symbol=symbol,
+            action="SELL",
+            qty=qty,
+            price=price,
+            reason=reason,
+        ):
+            executed_sells += 1
+
+    available_cash = settings.robinhood_agentic_buying_power
+    for item in plan.get("buys", []):
+        symbol = str(item.get("symbol") or "").upper()
+        price = _safe_num(item.get("price"), 0.0)
+        if not symbol or price <= 0:
+            continue
+        if settings.robinhood_use_dollar_orders and settings.robinhood_dollar_amount_per_trade > 0:
+            qty = 1
+            est_spend = settings.robinhood_dollar_amount_per_trade
+        else:
+            qty = max(1, settings.max_shares)
+            est_spend = price * qty
+        if est_spend > available_cash:
+            journal.write("robinhood_rotation_skip", {"symbol": symbol, "reason": "insufficient buying power", "estimated_spend": est_spend, "available_cash": available_cash})
+            continue
+        reason = f"rotation buy score={_safe_num(item.get('score'), 0.0):.1f}"
+        if _maybe_execute_robinhood_rule_locked_order(
+            settings=settings,
+            journal=journal,
+            notifier=notifier,
+            logger=logger,
+            symbol=symbol,
+            action="BUY",
+            qty=qty,
+            price=price,
+            reason=reason,
+        ):
+            available_cash = max(0.0, available_cash - est_spend)
 
 
 def _record_stock_dry_run(
@@ -1089,6 +1414,25 @@ def _trade_symbol(
         risk.clear_error_streak()
         return
 
+    if _maybe_execute_robinhood_rule_locked_order(
+        settings=settings,
+        journal=journal,
+        notifier=notifier,
+        logger=logger,
+        symbol=symbol,
+        action=action,
+        qty=decision.approved_qty,
+        price=signal.close,
+        reason="risk-approved signal",
+        order_type=settings.order_type,
+        limit_price=limit_price,
+        latest_price=latest_price,
+    ):
+        if action == "BUY" and cycle_state is not None:
+            cycle_state["buys"] = int(cycle_state.get("buys", 0) or 0) + 1
+        risk.clear_error_streak()
+        return
+
     order = broker.submit_order(
         symbol,
         action,
@@ -1324,6 +1668,7 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
     now = datetime.now(timezone.utc)
 
     try:
+        _refresh_robinhood_snapshots_if_needed(settings, logger, journal)
         if not _preflight_checks(settings, broker, logger):
             journal.write("preflight_failed", {"reason": "account not ready"})
             notifier.notify("error", "Pre-flight check failed: account not ready")
@@ -1341,6 +1686,13 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
 
         account = broker.account_state()
         journal.write("account_state", account)
+        _run_robinhood_rotation_phase(
+            settings=settings,
+            broker=broker,
+            journal=journal,
+            notifier=notifier,
+            logger=logger,
+        )
 
         # Record start-of-day equity for accurate daily loss tracking
         risk.set_start_of_day_equity(float(account["equity"]))
@@ -1356,6 +1708,13 @@ def run_once(symbol_override: str | None = None, skip_confirmation: bool = False
         else:
             symbols = cfg_symbols
         logger.info("Trading %d symbols", len(symbols))
+        _queue_research_packets_for_symbols(
+            settings=settings,
+            journal=journal,
+            logger=logger,
+            symbols=symbols,
+            source="bot_cycle",
+        )
 
         # EOD forced close: if within N minutes of market close, liquidate all positions
         if settings.close_before_eod > 0:
